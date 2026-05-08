@@ -1,0 +1,61 @@
+name: dapple
+display_name: DAPPLE
+visibility: public
+categories:
+  - "Image Processing"
+  - "IO"
+
+contributions:
+  commands:
+    - id: dapple.read_imzml
+      title: Read imzML
+      python_name: dapple.io.imzml_reader:napari_get_reader
+    - id: dapple.read_cdf
+      title: Read NetCDF
+      python_name: dapple.io.cdf_reader:napari_get_reader
+    - id: dapple.read_spec
+      title: Read .spec.xml
+      python_name: dapple.io.spec_xml:napari_get_reader
+    - id: dapple.open_wizard
+      title: Open DAPPLE Wizard
+      python_name: dapple.widgets.wizard:WizardWidget
+    - id: dapple.open_browser
+      title: Channels
+      python_name: dapple.widgets.channels:ChannelsPanel
+    - id: dapple.open_spectrum
+      title: Mass Spectrum Panel
+      python_name: dapple.widgets.spectrum:SpectrumPanel
+    - id: dapple.open_preview
+      title: DAPPLE Preview
+      python_name: dapple.widgets.preview:PreviewWidget
+    - id: dapple.open_threshold_explorer
+      title: Threshold Explorer
+      python_name: dapple.widgets.threshold_explorer:ThresholdExplorerPanel
+    - id: dapple.open_cohort
+      title: Cohort harmonization
+      python_name: dapple.widgets.cohort:CohortWidget
+
+  readers:
+    - command: dapple.read_imzml
+      filename_patterns: ["*.imzML", "*.imzml", "*.ibd"]
+      accepts_directories: false
+    - command: dapple.read_cdf
+      filename_patterns: ["*.cdf", "*.nc"]
+      accepts_directories: true
+    - command: dapple.read_spec
+      filename_patterns: ["*.spec.xml"]
+      accepts_directories: false
+
+  widgets:
+    - command: dapple.open_wizard
+      display_name: DAPPLE Wizard
+    - command: dapple.open_browser
+      display_name: Channels
+    - command: dapple.open_spectrum
+      display_name: Mass Spectrum Panel
+    - command: dapple.open_preview
+      display_name: DAPPLE Preview
+    - command: dapple.open_threshold_explorer
+      display_name: Threshold Explorer
+    - command: dapple.open_cohort
+      display_name: Cohort harmonization

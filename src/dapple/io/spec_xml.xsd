@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  dapple .spec.xml schema (placeholder).
+
+  Phase 1 ships this as an empty schema; the real Phase-2 schema validates
+  <spec> documents emitted by io/spec_xml.py against the urn:dapple:spec:v1
+  namespace, including provenance, experimentParams, pipeline, and diagnosticsSummary
+  blocks per the design plan §E.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:dapple:spec:v1"
+           xmlns="urn:dapple:spec:v1"
+           elementFormDefault="qualified">
+  <xs:element name="spec">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:any minOccurs="0" maxOccurs="unbounded" processContents="skip"/>
+      </xs:sequence>
+      <xs:attribute name="version" type="xs:string" use="required"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>

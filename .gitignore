@@ -1,0 +1,100 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+MANIFEST
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+ENV/
+.pyenv-version
+
+# --- Test / coverage ---
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.benchmarks/
+
+# --- Type checkers / linters ---
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.cache/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- DAPPLE caches & runtime artifacts ---
+.napari_msi_cache/
+.dapple_cache/
+*.zarr/
+
+# --- Local datasets (do NOT commit raw MSI data) ---
+datasets/
+data/
+*.imzML
+*.imzml
+*.ibd
+*.cdf
+*.nc
+
+# Allow tests/conftest-managed synthetic outputs paths *not* to be committed —
+# but allow .spec.xml fixtures shipped intentionally (none today; carve-out for future).
+!tests/fixtures/*.imzML
+!tests/fixtures/*.ibd
+
+# --- Build / package artifacts ---
+*.tif
+*.tiff
+*.spec.xml
+cohort_summary.json
+*_channels.csv
+*.dapple-axis.json
+
+# --- Notebooks (kept opt-in) ---
+.ipynb_checkpoints/
+
+# --- Misc ---
+*.log
+*.pid
+*.sqlite
+.env
+.env.local
