@@ -32,14 +32,6 @@ imzML  ·  multipage TIFF + CSV  ·  spec.xml
 - **Reproducibility manifest** (`.spec.xml`) capturing every operator, parameter, RNG seed, library version, and input hash. `dapple-apply-spec` reapplies a saved spec to a fresh dataset headless.
 - **Round-trip-safe outputs** — saved imzML carries a `dapple-harmonized` marker plus axis sidecar so a saved-then-reloaded harmonized file reappears with its consensus channels intact.
 
-## Design principles
-
-| Principle | What it means |
-| :-------- | :------------ |
-| **Conservative** | No imputation, no constant-ppm tolerance, no mean-spectrum peak picking. Every parametric default is paired with an empirical diagnostic that flags assumption violations on your data. |
-| **Reproducible** | Every run produces a `.spec.xml` that, combined with the input dataset, deterministically reproduces the output. Per-node content-addressed cache short-circuits unchanged steps on re-runs. |
-| **In-situ ML** | Any ML/DL operator must fit on the loaded dataset (or a small paired set — treatment/control, replicates). No bundled pre-trained generalist models. |
-| **Distribution-free where it counts** | Empirical CDF over k·σ for noise floors; permutation null over parametric assumptions for spatial structure tests. |
 
 ## Install
 
