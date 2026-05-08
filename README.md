@@ -122,28 +122,7 @@ Loads the spec, runs its pipeline against the new dataset, writes a fresh `.imzM
 - **[User guide](docs/userguide.md)** — wizard walkthrough, widget reference, common workflows, troubleshooting.
 - **[Algorithm reference](docs/algorithms.md)** — what each operator computes, parameter semantics, the rationale behind every default, the diagnostic rubric, and the file-format details.
 
-## Test data
-
-DAPPLE ships no datasets. The test suite uses on-the-fly synthetic fixtures by default; a separate suite gated by `MSI_REAL_DATA=1` runs against real-data files at a configurable path (see `tests/conftest.py`).
-
-```powershell
-pytest -q                     # synthetic + widget tests
-$env:MSI_REAL_DATA="1"; pytest -q   # also run real-data tests if present
-```
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-## Citation
-
-If you use DAPPLE in published work, please cite the repository:
-
-```bibtex
-@software{dapple,
-  title  = {DAPPLE: Diagnostic-Aware Pipelines for Mass-Spectrometry Imaging},
-  author = {Shah Lab, UCLA},
-  year   = {2026},
-  url    = {https://github.com/shahlab-ucla/DAPPLE},
-}
-```
