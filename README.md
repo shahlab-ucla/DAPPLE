@@ -1,6 +1,6 @@
 # DAPPLE
 
-**D**iagnostic-**A**ware **P**ipelines for **P**rocessing **L**ow-throughput **E**xperiments — a [napari](https://napari.org) plugin for mass-spectrometry imaging (MSI) that pairs every parametric default with an empirical diagnostic, runs reproducible processing chains, and harmonizes data across single images and cohorts.
+DAPPLE — a [napari](https://napari.org) plugin for mass-spectrometry imaging (MSI) that pairs every parametric default with an empirical diagnostic, runs reproducible processing chains, and harmonizes data across single images and cohorts.
 
 ```
 imzML / CDF
