@@ -23,7 +23,7 @@ imzML  ·  multipage TIFF + CSV  ·  spec.xml
 
 - **Loaders** for imzML (continuous + processed mode) and ANDI-MS NetCDF (single-file LC-MS and multi-file MSI imaging directories).
 - **Wizard** that captures experiment parameters, lets you pick polygon ROIs, recommends a processing chain tuned to your instrument family + acquisition mode, and runs it on a worker thread with live progress.
-- **Conservative operators** for the standard pipeline: empirical-tolerance fit (no constant-ppm assumption), MAD-based SNR or CWT peak picking, KDE or DBSCAN consensus alignment, MSIWarp or single-anchor lock-mass recalibration, Moran's I spatial filter with permutation-null FDR, hot-pixel correction, and ROI-driven background subtraction.
+- **Conservative operators** for the standard pipeline: empirical-tolerance fit (no constant-ppm assumption), MAD-based SNR or CWT peak picking, KDE or DBSCAN consensus alignment, MSIWarp or single-anchor lock-mass recalibration, Moran's I spatial filter with permutation-null FDR, prevalence FDR filter (occupancy-null permutation test, empirical replacement for fixed ``min_prevalence``), hot-pixel correction, and ROI-driven background subtraction.
 - **Diagnostics with health rubrics.** Every operator emits scalar metrics that the formatter renders in a tabular ✓ / ⚠ / ✗ block. Flagged metrics expand into per-state guidance: what the value means and which parameter to adjust to fix it. Same format in the GUI log and the headless CLIs.
 - **Per-channel viewer** (Channels Panel) — toggle, contrast, LUT-pick consensus channels and per-pixel projections; mosaic mode for side-by-side comparison.
 - **Spectrum panel** with single-pixel and polygon-aggregate modes, raw vs. harmonized toggle, and click-to-show-channel drill-down.
@@ -83,7 +83,7 @@ Seven pages, in order:
 2. **Experiment parameters** — auto-populated from imzML CV terms; review the **amber** badges (defaulted) before proceeding.
 3. **Preview** — click any of the six per-pixel projections to render it as a napari layer.
 4. **ROI** — draw polygons on the `MSI ROIs` shapes layer; mark some as background if needed.
-5. **Workflow** — review the recommended pipeline. Hover any field for a tooltip explaining what it does and how to adjust it. Two **optional cleanup operators** appear at the top (hot-pixel) and bottom (background subtract); tick the *Enable* checkbox to wire them into the chain.
+5. **Workflow** — review the recommended pipeline. Hover any field for a tooltip explaining what it does and how to adjust it. Three **optional cleanup operators** appear around the chain (hot-pixel correction, prevalence-FDR filter, background subtract); tick the *Enable* checkbox on each to wire it into the chain. Operators with multiple implementations (recalibration, normalization, consensus) carry a **Variant:** dropdown in their title row — swap MSIWarp ↔ lock-mass, median ↔ TIC ↔ reference-ion, or KDE ↔ DBSCAN without leaving the wizard.
 6. **Review** — final summary.
 7. **Run** — click **Run pipeline**. When done you see live diagnostic plots, a tabular health-rubric block in the log, a *Tune & rerun* button, and three save buttons: `.spec.xml`, `.imzML`, `.tif + _channels.csv`.
 

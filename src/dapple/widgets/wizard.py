@@ -477,6 +477,7 @@ class WorkflowPage(_BasePage):
         # rebuild on this page.
         self._optional_enabled: dict[str, bool] = {
             "hot_pixel_filter": False,
+            "prevalence_fdr_filter": False,
             "background_subtract": False,
         }
         self._summary = QLabel("(loading…)")
@@ -531,7 +532,11 @@ class WorkflowPage(_BasePage):
             # idempotent — the cards re-add them based on _optional_enabled.
             stripped = tuple(
                 n for n in pipeline.nodes
-                if n.op_name not in {"hot_pixel_filter", "background_subtract"}
+                if n.op_name not in {
+                    "hot_pixel_filter",
+                    "prevalence_fdr_filter",
+                    "background_subtract",
+                }
             )
             if len(stripped) != len(pipeline.nodes):
                 pipeline = pipeline.__class__(
@@ -544,9 +549,9 @@ class WorkflowPage(_BasePage):
         self._summary.setText(
             f"{len(pipeline.nodes)} operators in the recommended chain. "
             f"Hover any field for guidance on when and how to adjust it. "
-            f"Optional cleanup operators (hot-pixel filter, background subtract) "
-            f"are listed at the top and bottom — enable them with the checkbox "
-            f"on each card."
+            f"Optional cleanup operators (hot-pixel filter, prevalence FDR "
+            f"filter, background subtract) are listed around the chain — "
+            f"enable them with the checkbox on each card."
         )
         # Insert cards before the trailing stretch. If we have a previous run's
         # result on hand, look up the matching node's diagnostics so the card can
@@ -566,20 +571,41 @@ class WorkflowPage(_BasePage):
             ),
         )
 
-        # 2. Recommended-pipeline cards (always-on).
+        # 2. Recommended-pipeline cards (always-on). Each card with registered
+        # alternatives gets a Variant: dropdown — see ``_VARIANTS``. The card
+        # emits ``variant_changed`` when the user picks a different
+        # implementation; ``_on_variant_changed`` below rebuilds the pipeline.
         for node in pipeline.nodes:
             warns = self._operator_warnings(node, ds.metadata)
+            variant_alts = tuple(_VARIANTS.get(node.op_name, ()))
             card = _NodeCard(
                 node,
                 warnings=warns,
                 last_diagnostics=diags_by_node.get(node.id),
                 parent=self,
                 optional=False,
+                variant_alternatives=variant_alts,
             )
+            if variant_alts:
+                card.variant_changed.connect(self._on_variant_changed)
             self._cards.append(card)
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, card)
 
-        # 3. Optional post-pipeline cleanup: background_subtract at the END.
+        # 3. Optional permutation-null prevalence FDR filter — placed after the
+        # recommended chain so it operates on the final PeakMatrix. Acts as an
+        # empirical replacement for the conservative ``min_prevalence`` floor
+        # used by the consensus operator: drops channels whose prevalence is
+        # indistinguishable from random peak placement.
+        self._add_optional_card(
+            ds.metadata, op_name="prevalence_fdr_filter", node_id="prev_fdr",
+            optional_hint=(
+                "Drops consensus channels whose prevalence is indistinguishable "
+                "from random peak placement. Empirical alternative to the "
+                "fixed-floor 'min_prevalence' on the consensus card."
+            ),
+        )
+
+        # 4. Optional post-pipeline cleanup: background_subtract at the END.
         self._add_optional_card(
             ds.metadata, op_name="background_subtract", node_id="bgsub",
             optional_hint=(
@@ -628,6 +654,58 @@ class WorkflowPage(_BasePage):
     def _on_reset_defaults(self) -> None:
         self._wizard_ref._proposed_pipeline = None  # noqa: SLF001 — force rebuild
         self._rebuild_cards(use_proposed=False)
+
+    def _on_variant_changed(self, node_id: str, new_op_name: str) -> None:
+        """User picked an alternative implementation on one of the cards.
+
+        Snapshot every card's current edits into the proposed pipeline, swap
+        the targeted node's op_name (and reset its params to the new
+        operator's defaults — variants have different param shapes and we
+        don't try to translate field-by-field), then rebuild the cards.
+        """
+        ds = self._wizard_ref.session.dataset  # noqa: SLF001
+        if ds is None or self._wizard_ref._proposed_pipeline is None:  # noqa: SLF001
+            return
+        try:
+            new_op = REGISTRY.get(new_op_name)()
+        except KeyError:
+            return  # unregistered variant — silently ignore
+
+        # Build the new pipeline from the current cards, replacing the targeted
+        # node. Optional cards (disabled) are skipped — same logic as
+        # ``validatePage`` so the upstream chain stays consistent.
+        new_nodes: list[Node] = []
+        prev_id: str | None = None
+        for card in self._cards:
+            if not card.is_enabled():
+                continue
+            n = card.to_node()
+            if n.id == node_id:
+                # Swap to the new variant with its default params for the dataset.
+                n = Node(
+                    id=node_id,
+                    op_name=new_op_name,
+                    params=new_op.default_params(ds.metadata),
+                    upstream=(prev_id,) if prev_id is not None else (),
+                )
+            else:
+                # Re-thread upstream consistent with the new chain.
+                new_upstream: tuple[str, ...] = (prev_id,) if prev_id is not None else ()
+                if n.upstream != new_upstream:
+                    n = Node(
+                        id=n.id, op_name=n.op_name, params=n.params,
+                        upstream=new_upstream,
+                    )
+            new_nodes.append(n)
+            prev_id = n.id
+
+        old_pipeline = self._wizard_ref._proposed_pipeline  # noqa: SLF001
+        self._wizard_ref._proposed_pipeline = Pipeline(  # noqa: SLF001
+            nodes=tuple(new_nodes),
+            rng_seed=old_pipeline.rng_seed,
+            library_versions=detect_library_versions(),
+        )
+        self._rebuild_cards(use_proposed=True)
 
     def validatePage(self) -> bool:
         # Drop optional cards the user disabled, then re-thread upstream so each
@@ -990,16 +1068,80 @@ class RunPage(_BasePage):
 _OP_DISPLAY_NAMES: dict[str, str] = {
     "detect_reference_ions": "1. Reference-ion detection",
     "empirical_tolerance_from_reference_ions": "2. Empirical tolerance fit",
-    "msiwarp_recalibrate": "3. Mass recalibration",
+    "msiwarp_recalibrate": "3. Mass recalibration (MSIWarp)",
+    "lock_mass_recalibrate": "3. Mass recalibration (lock-mass)",
     "median_normalize": "4. Per-pixel normalization (median)",
     "tic_normalize": "4. Per-pixel normalization (TIC)",
     "reference_ion_normalize": "4. Per-pixel normalization (reference-ion)",
     "snr_peak_pick": "5. Peak picking (SNR / centroided)",
     "cwt_peak_pick": "5. Peak picking (CWT / profile)",
-    "kde_consensus_alignment": "6. Consensus peak alignment",
+    "kde_consensus_alignment": "6. Consensus peak alignment (KDE)",
+    "dbscan_consensus": "6. Consensus peak alignment (DBSCAN)",
     "morans_i_permutation": "7. Spatial filter (Moran's I)",
     "background_subtract": "(optional) Background subtraction",
     "hot_pixel_filter": "(optional) Hot-pixel correction",
+    "prevalence_fdr_filter": "(optional) Prevalence FDR filter",
+}
+
+
+# Each pipeline "slot" (recalibration, normalization, peak-picking, consensus)
+# has multiple operator implementations. Listing them here lets the WorkflowPage
+# render a "Variant" dropdown on each card so the user can swap between them
+# without dropping out to Python. The lists include the canonical operator at
+# the front; the dropdown remembers the current selection per node.
+_VARIANTS: dict[str, list[str]] = {
+    # Recalibration — single-anchor lock_mass is a robust alternative to
+    # MSIWarp's RANSAC piecewise-linear warp when anchor counts are low.
+    "msiwarp_recalibrate": ["msiwarp_recalibrate", "lock_mass_recalibrate"],
+    "lock_mass_recalibrate": ["msiwarp_recalibrate", "lock_mass_recalibrate"],
+    # Normalization — median is the default; TIC and reference-ion are
+    # available for the cases where median's assumptions break.
+    "median_normalize": ["median_normalize", "tic_normalize", "reference_ion_normalize"],
+    "tic_normalize": ["median_normalize", "tic_normalize", "reference_ion_normalize"],
+    "reference_ion_normalize": ["median_normalize", "tic_normalize", "reference_ion_normalize"],
+    # Consensus alignment — KDE is the default; DBSCAN is a discrete-cluster
+    # alternative for low-density peak pools.
+    "kde_consensus_alignment": ["kde_consensus_alignment", "dbscan_consensus"],
+    "dbscan_consensus": ["kde_consensus_alignment", "dbscan_consensus"],
+}
+
+
+_VARIANT_TOOLTIPS: dict[str, str] = {
+    "msiwarp_recalibrate": (
+        "<b>MSIWarp</b>: RANSAC piecewise-linear warp from multiple anchors per "
+        "pixel. Best when you have ≥ 3 visible reference ions per pixel."
+    ),
+    "lock_mass_recalibrate": (
+        "<b>Lock-mass</b>: single-anchor per-pixel shift. Pick when only one "
+        "trusted anchor (a spiked internal standard or stable matrix peak) is "
+        "reliable, or anchor counts are too low (<3) for MSIWarp's linear fit."
+    ),
+    "median_normalize": (
+        "<b>Per-pixel median</b> normalize (default): per-pixel non-zero median. "
+        "Robust to a single saturating peak. Best general-purpose default for "
+        "MSI tissue data."
+    ),
+    "tic_normalize": (
+        "<b>TIC normalize</b>: total ion current per pixel. Assumes uniform "
+        "ionization across pixels — fragile on tissue. Pick only when you know "
+        "ionization is uniform (cell culture, dispersed sample)."
+    ),
+    "reference_ion_normalize": (
+        "<b>Reference-ion normalize</b>: divide each pixel by the sum of "
+        "intensities at the detected reference ions. Defensible when matrix "
+        "peaks are stable across the image; can over-correct on heterogeneous "
+        "matrix coverage."
+    ),
+    "kde_consensus_alignment": (
+        "<b>KDE consensus</b> (default): kernel-density estimate on pooled "
+        "peaks in log-m/z space. Robust on dense peak pools; uses bandwidth "
+        "rather than hard cluster boundaries."
+    ),
+    "dbscan_consensus": (
+        "<b>DBSCAN consensus</b>: cluster individual peaks in log-m/z. Pick "
+        "when KDE bandwidth produces over-merged channels (sparse pools, "
+        "very close peak pairs) or when you want hard cluster assignments."
+    ),
 }
 
 
@@ -1091,6 +1233,27 @@ _PLOT_TOOLTIPS: dict[str, str] = {
         "<li><b>Distribution centered near 0</b> — no spatial structure (the "
         "sample isn't tissue, or the consensus channels are mostly noise). "
         "Disable the spatial filter on non-tissue samples.</li>"
+        "</ul>"
+    ),
+    "histogram:prevalence_fdr_q_values": (
+        "<b>Prevalence FDR — distribution of BH-adjusted q-values</b>"
+        "<p>Each consensus channel's q-value for the test "
+        "<em>is this channel's prevalence higher than random?</em>. The null "
+        "places k_c peaks uniformly across n_pixels bins (occupancy problem); "
+        "small q means the observed prevalence is far above what random "
+        "placement would produce.</p>"
+        "<p><b>Look for:</b></p>"
+        "<ul>"
+        "<li><b>Most channels at q ≈ 0</b> — every channel is clearly "
+        "non-random. Healthy on a well-segmented image.</li>"
+        "<li><b>Bimodal — one mode near 0, another near 1</b> — the filter is "
+        "doing meaningful work, cleanly separating signal from noise.</li>"
+        "<li><b>Uniform distribution on [0, 1]</b> — no channel is "
+        "distinguishable from noise. Upstream peak picking may be too "
+        "permissive; tighten ``snr_mad`` or raise ``min_prominence_quantile``.</li>"
+        "<li><b>Most channels above q_threshold</b> — the test is too strict "
+        "for this data. Raise q_threshold, or accept that this image lacks "
+        "spatially-coherent channels.</li>"
         "</ul>"
     ),
     "scatter:reference_mz_vs_prevalence": (
@@ -1245,6 +1408,30 @@ def _build_diagnostic_plot(node_id: str, diag) -> "QWidget | None":  # noqa: ANN
                 plot.setLabel("bottom", "Moran's I")
                 plot.setLabel("left", "channel count")
                 rendered = True
+    elif hint == "histogram:prevalence_fdr_q_values":
+        q = payload.get("q_values")
+        if q is not None and len(q):
+            arr = np.asarray(q)
+            arr = arr[np.isfinite(arr)]
+            if arr.size > 0:
+                bins = np.linspace(0.0, 1.0, 21)
+                hist, _ = np.histogram(arr, bins=bins)
+                plot.plot(
+                    bins,
+                    np.r_[hist, hist[-1]],
+                    stepMode="right",
+                    pen=pg.mkPen("#8c564b", width=1.2),
+                )
+                # Add a dashed vertical at q=0.05 (default cutoff) for orientation.
+                plot.addItem(
+                    pg.InfiniteLine(
+                        pos=0.05, angle=90,
+                        pen=pg.mkPen("#d62728", width=0.8, style=Qt.PenStyle.DashLine),
+                    )
+                )
+                plot.setLabel("bottom", "BH-adjusted q-value")
+                plot.setLabel("left", "channel count")
+                rendered = True
     elif hint == "scatter:reference_mz_vs_prevalence":
         mz = payload.get("reference_mz")
         prev = payload.get("prevalence")
@@ -1391,7 +1578,15 @@ class _NodeCard(QWidget):
     skips the node when building the Pipeline. State is queried via
     ``is_enabled()``; ``optional=False`` cards (the recommended-pipeline nodes)
     always report enabled.
+
+    Cards for operators with registered alternatives (recalibration,
+    normalization, consensus alignment) get a **Variant:** dropdown in the
+    title row that lets the user swap to an alternative implementation. The
+    swap fires ``variant_changed(node_id, new_op_name)`` so the parent
+    WorkflowPage can rebuild the cards with the new operator's params.
     """
+
+    variant_changed = Signal(str, str)  # (node_id, new_op_name)
 
     def __init__(
         self,
@@ -1403,6 +1598,7 @@ class _NodeCard(QWidget):
         optional: bool = False,
         enabled: bool = True,
         optional_hint: str = "",
+        variant_alternatives: tuple[str, ...] = (),
     ) -> None:
         super().__init__(parent)
         self._node = node
@@ -1410,6 +1606,7 @@ class _NodeCard(QWidget):
         self._inputs: dict[str, QWidget] = {}
         self._optional = optional
         self._enable_checkbox: QCheckBox | None = None
+        self._variant_combo: QComboBox | None = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(4)
@@ -1428,6 +1625,38 @@ class _NodeCard(QWidget):
         title = QLabel(f"<b>{display_name}</b>")
         title.setToolTip(f"node id: <code>{node.id}</code> · op: <code>{node.op_name}</code>")
         title_row.addWidget(title, stretch=1)
+        # Variant dropdown for cards with registered alternatives. Listed *before*
+        # the Reset button so it reads naturally as "pick an op, then reset its
+        # params if needed".
+        if variant_alternatives and len(variant_alternatives) > 1:
+            title_row.addWidget(QLabel("Variant:"))
+            self._variant_combo = QComboBox()
+            # Render the human-readable display name for each alternative; the
+            # underlying op_name is what we actually pass through validatePage.
+            for alt in variant_alternatives:
+                pretty = _OP_DISPLAY_NAMES.get(alt, alt.replace("_", " "))
+                # Strip the leading "N. " step number for the dropdown — the
+                # cards already convey their step position via the title.
+                if pretty[:3].rstrip().endswith("."):
+                    pretty = pretty.split(".", 1)[1].strip()
+                self._variant_combo.addItem(pretty, alt)
+            # Select the current op.
+            for i in range(self._variant_combo.count()):
+                if self._variant_combo.itemData(i) == node.op_name:
+                    self._variant_combo.setCurrentIndex(i)
+                    break
+            # Tooltip is the concatenated description of every alternative so
+            # the user can compare without scrolling. Each variant's text comes
+            # from ``_VARIANT_TOOLTIPS`` if registered, else a generic fallback.
+            tooltip_parts: list[str] = []
+            for alt in variant_alternatives:
+                tip = _VARIANT_TOOLTIPS.get(alt, "")
+                if tip:
+                    tooltip_parts.append(tip)
+            if tooltip_parts:
+                self._variant_combo.setToolTip("<br><br>".join(tooltip_parts))
+            self._variant_combo.currentIndexChanged.connect(self._on_variant_changed)
+            title_row.addWidget(self._variant_combo)
         reset = QPushButton("Reset")
         reset.setToolTip("Restore this node's parameters to the recommended defaults.")
         reset.clicked.connect(self._reset)
@@ -1510,6 +1739,20 @@ class _NodeCard(QWidget):
         """Grey out the form when the user disables an optional card."""
         if hasattr(self, "_form_widget") and self._form_widget is not None:
             self._form_widget.setEnabled(bool(enabled))
+
+    def _on_variant_changed(self, _idx: int) -> None:
+        """Forward variant swaps up to the parent WorkflowPage.
+
+        The parent rebuilds the whole card set because the new op has a
+        different ``OpParams`` dataclass (different field set) and we don't try
+        to transfer field values across variants — picking TIC after editing
+        median's eps wouldn't carry over meaningfully.
+        """
+        if self._variant_combo is None:
+            return
+        new_op = self._variant_combo.currentData()
+        if new_op and new_op != self._node.op_name:
+            self.variant_changed.emit(self._node.id, str(new_op))
 
     def _make_input(self, val: Any) -> QWidget:
         if isinstance(val, bool):

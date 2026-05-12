@@ -164,13 +164,33 @@ the default is what it is, and how to adjust it. Per-card **Reset** restores
 that node's defaults; the page-level **Reset all to defaults** rebuilds every
 card from scratch.
 
-The page also exposes two **optional cleanup operators**, each as a card with
-its own **Enable** checkbox (default off):
+Cards for operators with multiple implementations carry a **Variant:**
+dropdown in their title row so you can swap to an alternative without
+dropping out of the GUI:
+
+| Slot | Variants | When to swap |
+| :--- | :------- | :----------- |
+| Recalibration | ``msiwarp_recalibrate`` ↔ ``lock_mass_recalibrate`` | Lock-mass when only one trusted anchor / fewer than 3 visible anchors per pixel. |
+| Normalization | ``median_normalize`` ↔ ``tic_normalize`` ↔ ``reference_ion_normalize`` | TIC only when ionization is uniform; reference-ion when matrix peaks are stable across the image. |
+| Consensus | ``kde_consensus_alignment`` ↔ ``dbscan_consensus`` | DBSCAN on sparse peak pools where KDE bandwidth over-merges. |
+
+The dropdown's tooltip describes every variant; selecting one replaces the
+operator and resets its params to its own defaults (variants have different
+parameter shapes — we don't try to translate field-by-field). Edits on other
+cards are preserved across a swap.
+
+The page also exposes three **optional cleanup operators**, each as a card
+with its own **Enable** checkbox (default off):
 
 - **Hot-pixel correction** — at the *top* of the chain. Replaces detector
   glitches / matrix-crystal hot pixels with their neighbors' median TIC.
   Enable when the Preview's TIC view shows isolated extreme-bright pixels that
   dominate auto-contrast.
+- **Prevalence FDR filter** — *after the recommended chain.* Drops consensus
+  channels whose prevalence is indistinguishable from random peak placement
+  (permutation null on the occupancy problem, BH-FDR cutoff). An empirical
+  replacement for the fixed-floor ``min_prevalence`` on the consensus card —
+  better when channel peak counts span a wide range.
 - **Background subtraction** — at the *bottom* of the chain. Drops consensus
   channels whose mean intensity in background pixels is comparable to or
   larger than in foreground pixels. Requires consensus alignment **and** at

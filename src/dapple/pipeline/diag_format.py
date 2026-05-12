@@ -187,6 +187,19 @@ RUBRICS: dict[str, Rubric] = {
     "ppm_median": Rubric(label="tolerance median (ppm)", fmt="{:.2f}"),
     "ci_band_median_width": Rubric(label="ci band width (ppm)", fmt="{:.2f}"),
     "alpha": Rubric(label="alpha (coverage)", fmt="{:.3f}"),
+    "bootstrap_B": Rubric(label="bootstrap replicates", fmt="{:.0f}"),
+    "coarse_tol_ppm": Rubric(label="coarse_tol_ppm", fmt="{:.2f}"),
+    "n_pixels": Rubric(label="pixels in", fmt="{:.0f}"),
+    "anchor_strategy_index": Rubric(
+        label="anchor strategy",
+        fmt="{:.0f}",
+    ),
+    "factor_kind_tic": Rubric(
+        label="normalizer kind (0=median, 1=TIC)",
+        fmt="{:.0f}",
+    ),
+    "factor_q25": Rubric(label="scale factor q25", fmt="{:.4g}"),
+    "factor_q75": Rubric(label="scale factor q75", fmt="{:.4g}"),
 
     # msiwarp_recalibrate / lock_mass_recalibrate
     "fraction_pixels_recalibrated": Rubric(
@@ -398,6 +411,24 @@ RUBRICS: dict[str, Rubric] = {
     "n_permutations": Rubric(label="permutations", fmt="{:.0f}"),
     "q_threshold": Rubric(label="q_threshold", fmt="{:.3f}"),
 
+    # prevalence_fdr_filter
+    "p_value_min": Rubric(label="p-value min", fmt="{:.4f}"),
+    "p_value_median": Rubric(label="p-value median", fmt="{:.4f}"),
+    "q_value_min": Rubric(label="q-value min", fmt="{:.4f}"),
+    "q_value_median": Rubric(label="q-value median", fmt="{:.4f}"),
+    "warning_conservative_fallback": Rubric(
+        label="!! conservative fallback",
+        fmt="{:.0f}",
+        bad=lambda v: v >= 1.0,
+        meaning="set to 1 when the upstream consensus operator did not record "
+                "per-channel peak counts. The FDR test falls back to using the "
+                "observed non-zero count as the ball count, which produces a "
+                "conservative (under-rejective) test.",
+        bad_advice="re-run the upstream consensus operator so it records "
+                   "consensus_n_peaks_per_channel. The test is still valid but "
+                   "leaves more borderline channels in than it would otherwise.",
+    ),
+
     # hot_pixel_filter
     "n_hot_pixels": Rubric(label="hot pixels", fmt="{:.0f}"),
     "fraction_hot": Rubric(
@@ -449,8 +480,9 @@ OP_HEADERS: dict[str, str] = {
     "snr_peak_pick": "Peak picking (SNR / centroided)",
     "cwt_peak_pick": "Peak picking (CWT / profile)",
     "kde_consensus_alignment": "Consensus alignment (KDE)",
-    "dbscan_consensus_alignment": "Consensus alignment (DBSCAN)",
+    "dbscan_consensus": "Consensus alignment (DBSCAN)",
     "morans_i_permutation": "Spatial filter (Moran's I)",
+    "prevalence_fdr_filter": "Prevalence FDR filter",
     "hot_pixel_filter": "Hot-pixel filter",
     "background_subtract": "Background subtraction",
 }

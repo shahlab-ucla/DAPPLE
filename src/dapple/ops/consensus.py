@@ -228,6 +228,14 @@ class KdeConsensusAlignment(Operator):
         n_consensus = candidate_mz.size
         n_pixels = ds.n_pixels
         matrix = np.zeros((n_pixels, n_consensus), dtype=np.float32)
+        # Track the total number of (peak, pixel) assignments per channel — i.e.
+        # how many pre-aggregation peaks landed in each consensus channel across
+        # the image. Distinct from ``prevalence`` (which counts distinct pixels)
+        # and from ``matrix > 0`` (which max-aggregates to one cell per pixel).
+        # The PrevalenceFdrFilter operator uses this as the null-model's ball
+        # count: "if these k_c peaks were placed uniformly at random across
+        # n_pixels bins, would we expect to see this prevalence?"
+        n_peaks_per_channel = np.zeros(n_consensus, dtype=np.int64)
 
         # Build flat (pixel, consensus_idx, intensity) triples for both neighbor
         # candidates, then keep the max per (pixel, consensus).
@@ -248,6 +256,7 @@ class KdeConsensusAlignment(Operator):
             sorted_consensus = order[sel]  # back to original consensus indexing
             # Maximum-aggregate. Use scatter via np.maximum.at for correctness.
             np.maximum.at(matrix, (sel_peak_pix, sorted_consensus), sel_peak_int)
+            np.add.at(n_peaks_per_channel, sorted_consensus, 1)
 
         # ---- Prevalence filter ----
         prevalence = (matrix > 0).sum(axis=0) / n_pixels
@@ -270,19 +279,24 @@ class KdeConsensusAlignment(Operator):
         kept_mz = candidate_mz[keep]
         kept_matrix = matrix[:, keep]
         kept_prev = prevalence[keep]
+        kept_n_peaks = n_peaks_per_channel[keep]
 
         # Sort kept consensus by m/z so downstream code sees monotone order.
         order_kept = np.argsort(kept_mz)
         kept_mz = kept_mz[order_kept]
         kept_matrix = kept_matrix[:, order_kept]
         kept_prev = kept_prev[order_kept]
+        kept_n_peaks = kept_n_peaks[order_kept]
 
         peakmatrix = PeakMatrix(matrix=kept_matrix.astype(np.float32, copy=False), mz_axis=kept_mz)
         new_ds = ds.with_backend(peakmatrix)
         # Attach prevalence vector for the HyperspectralBrowser to display.
+        # `consensus_n_peaks_per_channel` is the total count of (peak, pixel)
+        # assignments per channel — needed by PrevalenceFdrFilter's null model.
         new_extra = {
             **ds.extra,
             "consensus_prevalence": kept_prev.astype(np.float64, copy=False),
+            "consensus_n_peaks_per_channel": kept_n_peaks.astype(np.int64, copy=False),
         }
         new_ds = new_ds.__class__(
             coords=new_ds.coords,

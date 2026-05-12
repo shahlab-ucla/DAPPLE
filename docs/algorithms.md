@@ -24,16 +24,17 @@ committed, this document explains why — and what would push you up or down.
 9. [Operator: cwt_peak_pick](#operator-cwt_peak_pick)
 10. [Operator: kde_consensus_alignment](#operator-kde_consensus_alignment)
 11. [Operator: dbscan_consensus](#operator-dbscan_consensus)
-12. [Operator: morans_i_permutation](#operator-morans_i_permutation)
-13. [Operator: hot_pixel_filter](#operator-hot_pixel_filter)
-14. [Operator: background_subtract](#operator-background_subtract)
-15. [Cohort harmonization](#cohort-harmonization)
-16. [Per-pixel projections](#per-pixel-projections)
-17. [Pipeline runner: caching, hashing, RNG](#pipeline-runner-caching-hashing-rng)
-18. [Diagnostic rubric & health checks](#diagnostic-rubric--health-checks)
-19. [Reproducibility manifest (`.spec.xml`)](#reproducibility-manifest-specxml)
-20. [Harmonized imzML round-trip](#harmonized-imzml-round-trip)
-21. [Headless CLIs](#headless-clis)
+12. [Operator: prevalence_fdr_filter](#operator-prevalence_fdr_filter)
+13. [Operator: morans_i_permutation](#operator-morans_i_permutation)
+14. [Operator: hot_pixel_filter](#operator-hot_pixel_filter)
+15. [Operator: background_subtract](#operator-background_subtract)
+16. [Cohort harmonization](#cohort-harmonization)
+17. [Per-pixel projections](#per-pixel-projections)
+18. [Pipeline runner: caching, hashing, RNG](#pipeline-runner-caching-hashing-rng)
+19. [Diagnostic rubric & health checks](#diagnostic-rubric--health-checks)
+20. [Reproducibility manifest (`.spec.xml`)](#reproducibility-manifest-specxml)
+21. [Harmonized imzML round-trip](#harmonized-imzml-round-trip)
+22. [Headless CLIs](#headless-clis)
 
 ---
 
@@ -662,8 +663,11 @@ A future panel will surface this as live sliders.
 
 ### Notes
 
-A permutation-null FDR test for the prevalence filter is planned but not yet
-implemented; the current `min_prevalence` floor is a conservative substitute.
+The conservative `min_prevalence` floor applied here can be replaced (or
+followed) by the empirical permutation-FDR test
+[`prevalence_fdr_filter`](#operator-prevalence_fdr_filter), which adapts to
+each channel's total peak count rather than imposing a fixed prevalence
+threshold across all channels.
 
 ---
 
@@ -727,6 +731,109 @@ DBSCAN is also faster than KDE on small pools because it avoids the O(n_grid)
 density evaluation, but loses to KDE on large pools because of its
 neighborhood graph. The two tend to agree to within ±2 channels on the synth
 fixture (5 planted peaks, 25 pixels).
+
+---
+
+## Operator: `prevalence_fdr_filter`
+
+Module: [`ops/prevalence_filter.py`](../src/dapple/ops/prevalence_filter.py)
+
+### Purpose
+
+Empirical replacement for the conservative ``min_prevalence`` floor inside
+the consensus operators. Tests, per channel, whether the observed prevalence
+is higher than the random-placement null would produce — and drops channels
+that fail to reject.
+
+Why this is better than a fixed threshold: a flat ``min_prevalence = 0.05``
+treats all channels alike, but the right floor depends on how many *peaks*
+the channel has. A channel with 200 peaks placed at random across 200 pixels
+fills ~63% of pixels by pure chance, so observing 5% prevalence there is
+*below* the null (noise). A channel with 5 peaks placed at random fills
+~2.5%, so observing 5% prevalence is well above the null (signal). The FDR
+test scales the bar per channel; a fixed floor cannot.
+
+### Algorithm
+
+Inputs:
+
+- `ds.backend.matrix`: dense `(n_pixels, n_channels)` float32 PeakMatrix.
+- `ds.extra["consensus_n_peaks_per_channel"]`: `(n_channels,) int64` —
+  total peak-to-pixel assignments per channel, recorded by the upstream
+  consensus operator (KDE or DBSCAN).
+
+For each channel `c`:
+
+1. **Observed statistic.** `p_obs(c) = (matrix[:, c] > 0).sum() / n_pixels` —
+   fraction of pixels with non-zero intensity at channel c.
+
+2. **Null model.** Place `k_c` peaks uniformly at random into `n_pixels` bins
+   ("occupancy problem"). Count distinct bins; divide by `n_pixels` to get
+   the null's prevalence. Under the null, the expected occupancy is
+
+   $$
+   \mathbb{E}[p_\text{null}(c)] \;=\; 1 - (1 - 1/n_\text{pixels})^{k_c}
+   $$
+
+3. **Monte Carlo.** Sample B (default 499) realizations of the null per
+   channel. Vectorized per-channel: allocate `(B, n_pixels)` bool, scatter
+   `B*k_c` uniform pixel indices, sum along axis 1 for distinct counts.
+
+4. **Right-tail empirical p-value** with the +1/+1 stabilizer:
+
+   $$
+   p_c \;=\; \frac{|\{b : p_\text{null}^{(b)}(c) \ge p_\text{obs}(c)\}| + 1}{B + 1}
+   $$
+
+5. **Benjamini–Hochberg adjustment** across channels.
+
+6. Drop channels with `q_c >= q_threshold` (default 0.05).
+
+### Output
+
+`MSIDataset` with a `PeakMatrix` backend trimmed to surviving channels.
+Companion arrays in `ds.extra` (`consensus_prevalence`,
+`consensus_n_peaks_per_channel`) are subset to match. Diagnostic payload
+carries `p_values`, `q_values`, `kept_mask`, `channel_mz_in`, `k_per_channel`,
+`p_obs`.
+
+### Parameters
+
+| Field | Default | Adjustment guidance |
+| :---- | :------ | :------------------ |
+| `n_permutations` | 499 | p-value resolution ~ 1/(B+1). Drop to 99 for fast iteration; raise to 1999 when N_channels > 1000. |
+| `q_threshold` | 0.05 | Standard FDR floor. Raise to 0.1 for permissive; lower to 0.01 for strict. |
+| `min_pixels_for_test` | 64 | Below this the null is too coarse to discriminate — operator passes through. |
+| `rng_seed` | 0 | Mixed with global pipeline seed for deterministic re-runs. |
+
+### Diagnostic
+
+`summary` keys: `n_channels_in`, `n_channels_out`, `n_dropped_by_fdr`,
+`n_permutations`, `q_threshold`, `p_value_min/median`, `q_value_min/median`.
+`warning_conservative_fallback=1.0` is set when
+`consensus_n_peaks_per_channel` is missing from `ds.extra` (the operator
+falls back to using the observed pixel count, yielding a conservative test).
+
+`figure_hint`: `histogram:prevalence_fdr_q_values` — distribution of BH-FDR
+q-values across channels with a vertical line at the threshold.
+
+### When to use
+
+- After consensus alignment, on any PeakMatrix-backed dataset.
+- Especially when channel counts span a wide range — fixed-floor
+  ``min_prevalence`` over-rejects sparse channels and under-rejects dense
+  ones.
+- Before ``morans_i_permutation``: this filter removes prevalence-noise
+  channels (which Moran's I would call "no spatial structure" anyway); after
+  this filter, Moran's I has fewer channels to test, sharpening its FDR.
+
+### Caveats
+
+- The null assumes peaks are placed *independently* across pixels. If your
+  data has strong spatial structure, the null is appropriate (we're testing
+  for above-random prevalence, structure handled separately).
+- Computational cost is O(B * Σ k_c) — manageable up to a few thousand
+  channels each with a few hundred peaks.
 
 ---
 
@@ -1134,6 +1241,8 @@ operator plus the cohort flow. Highlights:
 | `lock_mass_recalibrate` | `ppm_shift_abs_median` | < 50 | Above 200 likely indicates bad anchor strategy |
 | `kde_consensus_alignment` / `dbscan_consensus` | `n_consensus_peaks` | ≥ 10 | The user-visible channel count |
 | `dbscan_consensus` | `fraction_noise` | < 0.5 | Above 0.8 means params are too strict |
+| `prevalence_fdr_filter` | `n_channels_out` | ≥ 1 | Zero means every channel was rejected — relax q_threshold |
+| `prevalence_fdr_filter` | `warning_conservative_fallback` | absent | Upstream consensus didn't record n_peaks_per_channel — re-run it |
 | `morans_i_permutation` | `n_channels_out` | ≥ 1 | Zero means everything was rejected |
 | `hot_pixel_filter` | `fraction_hot` | ≤ 0.05 | Above 15% means real structure is being clipped |
 | `align_cohort` | `n_consensus_shared` | ≥ 10 | Shared-axis channel count |
@@ -1149,10 +1258,10 @@ figure-hint type. Each tooltip describes:
   paired with the parameter to adjust (e.g. *"Broad humps with multiple red
   marks inside — bandwidth too narrow; raise `bandwidth_ppm`"*).
 
-The seven supported figure hints cover KDE density, tolerance line+CI,
+The eight supported figure hints cover KDE density, tolerance line+CI,
 per-pixel factor histogram, per-pixel kept-count histogram, Moran's I
-distribution, reference m/z vs prevalence scatter, and pre/post recalibration
-residual histograms.
+distribution, prevalence-FDR q-value distribution, reference m/z vs
+prevalence scatter, and pre/post recalibration residual histograms.
 
 ---
 

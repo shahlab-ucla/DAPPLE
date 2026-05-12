@@ -158,6 +158,9 @@ class DbscanConsensusAlignment(Operator):
         # Map original DBSCAN labels to consensus column indices.
         label_to_col = {int(lbl): i for i, lbl in enumerate(unique_labels)}
         matrix = np.zeros((n_pixels, unique_labels.size), dtype=np.float32)
+        # Track total peak assignments per cluster — needed by PrevalenceFdrFilter's
+        # null model. See KdeConsensusAlignment for the same accounting.
+        n_peaks_per_channel = np.zeros(unique_labels.size, dtype=np.int64)
         for i, lbl in enumerate(labels):
             if lbl < 0:
                 continue
@@ -166,11 +169,13 @@ class DbscanConsensusAlignment(Operator):
             v = peak_int[i]
             if v > matrix[row, col]:
                 matrix[row, col] = v
+            n_peaks_per_channel[col] += 1
 
         # Sort by centroid m/z so downstream consumers see a monotone axis.
         order = np.argsort(cluster_centroid)
         cluster_centroid = cluster_centroid[order]
         matrix = matrix[:, order]
+        n_peaks_per_channel = n_peaks_per_channel[order]
 
         prevalence = (matrix > 0).sum(axis=0) / max(n_pixels, 1)
         keep = prevalence >= params.min_prevalence
@@ -183,6 +188,7 @@ class DbscanConsensusAlignment(Operator):
         kept_centroid = cluster_centroid[keep]
         kept_matrix = matrix[:, keep]
         kept_prev = prevalence[keep]
+        kept_n_peaks = n_peaks_per_channel[keep]
 
         peakmatrix = PeakMatrix(
             matrix=kept_matrix.astype(np.float32, copy=False), mz_axis=kept_centroid
@@ -190,6 +196,7 @@ class DbscanConsensusAlignment(Operator):
         new_extra = {
             **ds.extra,
             "consensus_prevalence": kept_prev.astype(np.float64, copy=False),
+            "consensus_n_peaks_per_channel": kept_n_peaks.astype(np.int64, copy=False),
         }
         new_ds = ds.with_backend(peakmatrix).__class__(
             coords=ds.coords,

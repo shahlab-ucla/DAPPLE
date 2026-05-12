@@ -18,6 +18,10 @@ from dapple.ops.peak_pick import (
     SnrPeakPick,
     SnrPeakPickParams,
 )
+from dapple.ops.prevalence_filter import (
+    PrevalenceFdrFilter,
+    PrevalenceFdrParams,
+)
 from dapple.ops.recalibrate import (
     LockMassRecalibrate,
     LockMassRecalibrateParams,
@@ -63,6 +67,8 @@ __all__ = [
     "OpParams",
     "OpResult",
     "Operator",
+    "PrevalenceFdrFilter",
+    "PrevalenceFdrParams",
     "ReferenceIonNormalize",
     "ReferenceIonNormalizeParams",
     "ReferenceIonsParams",
