@@ -62,6 +62,8 @@ def test_write_imzml_emits_harmonized_marker_for_peakmatrix(synth_centroided, tm
 
     sidecar = result.imzml_path.with_suffix(".dapple-axis.json")
     assert sidecar.exists(), "missing .dapple-axis.json sidecar"
+    assert result.axis_sidecar_path == sidecar
+    assert result.artifact_paths == (result.imzml_path, result.ibd_path, sidecar)
 
 
 def test_write_imzml_no_marker_for_peaklist(synth_centroided, tmp_path):
@@ -75,6 +77,7 @@ def test_write_imzml_no_marker_for_peaklist(synth_centroided, tmp_path):
     xml = result.imzml_path.read_text(encoding="utf-8")
     assert "dapple-harmonized" not in xml
     assert not result.imzml_path.with_suffix(".dapple-axis.json").exists()
+    assert result.artifact_paths == (result.imzml_path, result.ibd_path)
 
 
 def test_round_trip_restores_peakmatrix_backend(synth_centroided, tmp_path):
@@ -155,6 +158,81 @@ def test_missing_sidecar_falls_back_to_peaklist(synth_centroided, tmp_path):
     with pytest.warns(UserWarning, match="restoration failed"):
         reloaded = read_imzml(out)
     # Falls back to PeakList rather than crashing.
+    assert isinstance(reloaded.backend, PeakList)
+
+
+def test_sidecar_with_wrong_ibd_md5_is_never_restored(synth_centroided, tmp_path):
+    import json
+
+    from dapple.data.dataset import PeakList
+    from dapple.io.imzml_reader import read_imzml
+    from dapple.io.imzml_writer import write_imzml
+
+    out = tmp_path / "harmonized.imzML"
+    write_imzml(_build_aligned_dataset(synth_centroided), out)
+    sidecar_path = out.with_suffix(".dapple-axis.json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["ibd_md5"] = "0" * 32
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    with pytest.warns(UserWarning, match="different .ibd"):
+        reloaded = read_imzml(out)
+    assert isinstance(reloaded.backend, PeakList)
+
+
+def test_sidecar_axis_must_match_written_peak_values(synth_centroided, tmp_path):
+    import json
+
+    from dapple.data.dataset import PeakList
+    from dapple.io.imzml_reader import read_imzml
+    from dapple.io.imzml_writer import write_imzml
+
+    out = tmp_path / "harmonized.imzML"
+    write_imzml(_build_aligned_dataset(synth_centroided), out)
+    sidecar_path = out.with_suffix(".dapple-axis.json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["shared_mz_axis"][0] *= 1.01
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    with pytest.warns(UserWarning, match="do not match"):
+        reloaded = read_imzml(out)
+    assert isinstance(reloaded.backend, PeakList)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda sidecar: [sidecar], "must contain a JSON object"),
+        (
+            lambda sidecar: {**sidecar, "shared_mz_axis": "100, 200"},
+            "shared_mz_axis.*must be a JSON array",
+        ),
+        (
+            lambda sidecar: {**sidecar, "n_channels": "many"},
+            "n_channels.*must be an integer",
+        ),
+        (
+            lambda sidecar: {**sidecar, "consensus_prevalence": {"bad": True}},
+            "consensus_prevalence.*must be null or a JSON array",
+        ),
+    ],
+)
+def test_malformed_axis_sidecar_warns_and_falls_back_without_uncaught_error(
+    synth_centroided, tmp_path, mutate, message
+):
+    """Malformed JSON shapes and types take the documented PeakList fallback."""
+    import json
+
+    from dapple.data.dataset import PeakList
+    from dapple.io.imzml_reader import read_imzml
+    from dapple.io.imzml_writer import write_imzml
+
+    out = tmp_path / "harmonized.imzML"
+    write_imzml(_build_aligned_dataset(synth_centroided), out)
+    sidecar_path = out.with_suffix(".dapple-axis.json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_path.write_text(json.dumps(mutate(sidecar)), encoding="utf-8")
+
+    with pytest.warns(UserWarning, match=message):
+        reloaded = read_imzml(out)
     assert isinstance(reloaded.backend, PeakList)
 
 

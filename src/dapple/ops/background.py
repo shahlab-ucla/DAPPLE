@@ -27,8 +27,13 @@ from typing import Literal
 
 import numpy as np
 
-from dapple.data.coords import coords_to_grid_index
-from dapple.data.dataset import MSIDataset, PeakMatrix
+from dapple.analysis.spatial import rasterize_rois
+from dapple.data.dataset import (
+    CHANNEL_ALIGNED_EXTRA_KEYS,
+    MSIDataset,
+    PeakMatrix,
+    subset_channel_aligned_extra,
+)
 from dapple.data.metadata import ExperimentParams, RoiDef
 from dapple.ops.base import (
     Diagnostic,
@@ -103,6 +108,7 @@ class BackgroundSubtractParams(OpParams):
 class BackgroundSubtract(Operator):
     name = "background_subtract"
     params_cls = BackgroundSubtractParams
+    depends_on_rois = True
 
     def default_params(self, ep: ExperimentParams) -> BackgroundSubtractParams:
         return BackgroundSubtractParams()
@@ -157,15 +163,12 @@ class BackgroundSubtract(Operator):
             new_matrix = matrix[:, keep_mask].astype(np.float32, copy=False)
             new_axis = np.asarray(pm.mz_axis[:])[keep_mask].astype(np.float64, copy=False)
             new_pm = PeakMatrix(matrix=new_matrix, mz_axis=new_axis)
-            new_extra = {**ds.extra}
-            # Trim the consensus-prevalence vector if it's present.
-            if "consensus_prevalence" in new_extra:
-                old_prev = np.asarray(new_extra["consensus_prevalence"])
-                if old_prev.shape == (matrix.shape[1],):
-                    new_extra["consensus_prevalence"] = old_prev[keep_mask]
+            new_extra = subset_channel_aligned_extra(
+                ds.extra, keep_mask, matrix.shape[1]
+            )
             new_extra["bg_subtract_dropped_n"] = n_dropped
             new_extra["bg_subtract_dropped_mz"] = np.asarray(pm.mz_axis[:])[~keep_mask]
-            new_ds = ds.with_backend(new_pm).__class__(
+            new_ds = ds.__class__(
                 coords=ds.coords,
                 grid_shape=ds.grid_shape,
                 metadata=ds.metadata,
@@ -183,8 +186,29 @@ class BackgroundSubtract(Operator):
                 matrix=corrected.astype(np.float32, copy=False),
                 mz_axis=pm.mz_axis,
             )
-            new_extra = {**ds.extra, "bg_subtract_per_channel_bg_mean": bg_mean}
-            new_ds = ds.with_backend(new_pm).__class__(
+            keep_all = np.ones(matrix.shape[1], dtype=bool)
+            # Intensity subtraction changes carrier prevalence and invalidates
+            # any previously computed per-channel spatial or cohort scores.
+            # Retain non-channel state, then attach the statistics that can be
+            # recomputed exactly from the corrected matrix.
+            unscored_extra = {
+                key: value
+                for key, value in ds.extra.items()
+                if key not in CHANNEL_ALIGNED_EXTRA_KEYS
+            }
+            corrected_carriers = (corrected > 0).sum(axis=0).astype(np.int64)
+            new_extra = subset_channel_aligned_extra(
+                unscored_extra,
+                keep_all,
+                matrix.shape[1],
+                replacements={
+                    "bg_subtract_per_channel_bg_mean": bg_mean,
+                    "consensus_prevalence": corrected_carriers / max(ds.n_pixels, 1),
+                    "consensus_n_peaks_per_channel": corrected_carriers,
+                    "n_peaks_per_channel": corrected_carriers,
+                },
+            )
+            new_ds = ds.__class__(
                 coords=ds.coords,
                 grid_shape=ds.grid_shape,
                 metadata=ds.metadata,
@@ -230,28 +254,37 @@ class BackgroundSubtract(Operator):
 def _foreground_background_masks(
     ds: MSIDataset, *, use_outside_as_bg: bool
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build boolean (n_pixels,) masks for foreground and background populations."""
-    from skimage.draw import polygon as sk_polygon
+    """Build class unions, rejecting only foreground/background ambiguity.
 
-    h, w = ds.grid_shape
-    fg_grid = np.zeros((h, w), dtype=bool)
-    bg_grid = np.zeros((h, w), dtype=bool)
-    has_fg = False
-    has_bg = False
-    for roi in ds.rois:
-        ys = np.asarray([v[0] for v in roi.vertices])
-        xs = np.asarray([v[1] for v in roi.vertices])
-        rr, cc = sk_polygon(ys, xs, shape=(h, w))
-        if roi.is_background:
-            bg_grid[rr, cc] = True
-            has_bg = True
-        else:
-            fg_grid[rr, cc] = True
-            has_fg = True
+    Multiple polygons of the same semantic class are commonly used to cover a
+    disconnected tissue or background region. Their overlaps are harmless and
+    collapse into a union; a populated pixel covered by both classes remains an
+    ambiguous assignment and is rejected.
+    """
+    fg_rois = tuple(r for r in ds.rois if not r.is_background)
+    bg_rois = tuple(r for r in ds.rois if r.is_background)
+    has_fg = bool(fg_rois)
+    has_bg = bool(bg_rois)
 
-    flat = coords_to_grid_index(ds.coords, ds.grid_shape)
-    fg_mask = fg_grid.reshape(-1)[flat]
-    bg_mask = bg_grid.reshape(-1)[flat]
+    def _class_union(rois: tuple[RoiDef, ...]) -> np.ndarray:
+        if not rois:
+            return np.zeros(ds.n_pixels, dtype=bool)
+        masks = rasterize_rois(ds, rois, overlap_policy="allow")
+        return masks.union(tuple(r.name for r in rois))
+
+    try:
+        fg_mask = _class_union(fg_rois)
+        bg_mask = _class_union(bg_rois)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid ROI assignment: {exc}") from exc
+
+    cross_class_overlap = fg_mask & bg_mask
+    if cross_class_overlap.any():
+        raise RuntimeError(
+            "foreground and background ROI assignments must be unambiguous: "
+            f"{int(cross_class_overlap.sum())} populated pixel(s) belong to "
+            "both semantic classes"
+        )
 
     if has_fg and not has_bg and use_outside_as_bg:
         # Treat any populated pixel that isn't foreground as background.

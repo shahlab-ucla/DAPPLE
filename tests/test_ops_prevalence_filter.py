@@ -1,4 +1,4 @@
-"""Tests for ``PrevalenceFdrFilter`` — permutation-null FDR test for the prevalence filter.
+"""Tests for the experimental occupancy calculation in ``PrevalenceFdrFilter``.
 
 Pipeline contract:
 
@@ -7,8 +7,11 @@ Pipeline contract:
 - For each channel: simulate B uniform placements of ``k_c`` peaks into
   ``n_pixels`` pixels, count distinct pixels (occupancy), convert to
   prevalence. Compare to observed.
-- Right-tail p-value with +1/+1 stabilizer, BH-FDR across channels, drop
-  channels above ``q_threshold``.
+- Calculate the implemented right-tail score with +1/+1 stabilization, adjust
+  across channels, and drop channels above ``q_threshold``.
+
+These tests verify implementation behavior under the declared toy model; they
+do not assert that its scores are calibrated after real consensus selection.
 """
 
 from __future__ import annotations
@@ -112,6 +115,34 @@ def test_default_params_have_labels_and_help():
     for f in fields(PrevalenceFdrParams):
         assert field_label(f), f"missing label on {f.name}"
         assert field_help(f), f"missing help on {f.name}"
+
+
+def test_operator_warns_that_occupancy_scores_are_experimental():
+    metadata = ExperimentParams(
+        instrument_family="unknown",
+        ionization="unknown",
+        profile_or_centroided="centroided",
+        polarity="positive",
+        mz_min=100.0,
+        mz_max=1000.0,
+    )
+    warnings = PrevalenceFdrFilter().validate(metadata)
+    assert warnings
+    assert "anti-conservative" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"n_permutations": 0},
+        {"q_threshold": 0.0},
+        {"q_threshold": 1.1},
+        {"min_pixels_for_test": 0},
+    ],
+)
+def test_invalid_params_are_rejected(kwargs):
+    with pytest.raises(ValueError):
+        PrevalenceFdrParams(**kwargs)
 
 
 # ---- consensus operator records n_peaks_per_channel -------------------------
@@ -271,12 +302,39 @@ def test_companion_arrays_subset_after_filter():
     new = result.dataset
     assert len(new.extra["consensus_prevalence"]) == new.backend.n_peaks
     assert len(new.extra["consensus_n_peaks_per_channel"]) == new.backend.n_peaks
+    assert len(new.extra["prevalence_fdr_p_values"]) == new.backend.n_peaks
+    assert len(new.extra["prevalence_fdr_q_values"]) == new.backend.n_peaks
     # Top two channels had prevalence 0.95.
     np.testing.assert_allclose(
         np.asarray(new.extra["consensus_prevalence"]),
         np.array([0.95, 0.95]),
         atol=0.01,
     )
+
+
+def test_occupancy_null_does_not_allocate_dense_permutation_by_pixel_matrix(
+    monkeypatch,
+):
+    """Null memory should scale with sampled peaks, not total image pixels."""
+    ds = _make_fake_peakmatrix_dataset(
+        n_pixels=200,
+        prevalences=[0.95, 0.50],
+        peaks_per_channel=[200, 200],
+    )
+    real_zeros = np.zeros
+
+    def guarded_zeros(shape, *args, **kwargs):
+        if isinstance(shape, tuple) and len(shape) == 2:
+            raise AssertionError(f"unexpected dense 2-D null allocation: {shape}")
+        return real_zeros(shape, *args, **kwargs)
+
+    monkeypatch.setattr("dapple.ops.prevalence_filter.np.zeros", guarded_zeros)
+    result = PrevalenceFdrFilter().apply(
+        ds,
+        PrevalenceFdrParams(n_permutations=49, q_threshold=0.05),
+        rng=np.random.default_rng(0),
+    )
+    assert result.dataset.backend.n_peaks == 1
 
 
 # ---- fallback paths ---------------------------------------------------------

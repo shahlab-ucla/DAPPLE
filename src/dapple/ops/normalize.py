@@ -135,10 +135,14 @@ def _normalize_by_factor(
             continue
         seg = intensity[a:b]
         if factor_kind == "tic":
-            factors[i] = max(float(seg.sum()), params.eps)
+            # Negative baselines can cancel a TIC to ~0. Dividing by eps would
+            # explode the entire spectrum, so define TIC over positive signal and
+            # leave a no-positive-signal pixel unchanged.
+            positive = seg[seg > 0]
+            factors[i] = max(float(positive.sum()), params.eps) if positive.size else 1.0
         else:  # median over non-zero entries
             nz = seg[seg > 0]
-            factors[i] = max(float(np.median(nz)) if nz.size else params.eps, params.eps)
+            factors[i] = max(float(np.median(nz)), params.eps) if nz.size else 1.0
 
     # Apply factors per pixel.
     for i in range(pl.n_pixels):
@@ -193,6 +197,23 @@ class ReferenceIonNormalizeParams(OpParams):
             ),
         },
     )
+    missing_reference_policy: Literal["median_valid", "error"] = field(
+        default="median_valid",
+        metadata={
+            "label": "Missing-reference policy",
+            "help": (
+                "median_valid uses the median factor from pixels with detected "
+                "reference signal, avoiding catastrophic division by epsilon. "
+                "error stops instead when any pixel lacks a reference ion."
+            ),
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.eps <= 0:
+            raise ValueError("eps must be positive")
+        if self.missing_reference_policy not in {"median_valid", "error"}:
+            raise ValueError("missing_reference_policy must be 'median_valid' or 'error'")
 
 
 @register
@@ -246,11 +267,22 @@ class ReferenceIonNormalize(Operator):
         intensity = np.asarray(pl.intensity[:]).astype(np.float32, copy=True)
         n_pixels = pl.n_pixels
 
-        # Per-pixel scale = sum of reference intensities; clamp at eps to avoid
-        # division by zero on pixels where no reference ion was detected.
+        # Per-pixel scale = sum of reference intensities. Missing-reference pixels
+        # must never be divided by epsilon: that turns ordinary signal into values
+        # around 1e12 and creates false spatial hotspots.
         per_pixel_ref_sum = ref.per_pixel_intensity.sum(axis=1).astype(np.float64)
-        n_at_floor = int((per_pixel_ref_sum <= 0).sum())
-        factors = np.maximum(per_pixel_ref_sum, params.eps)
+        valid_factor = np.isfinite(per_pixel_ref_sum) & (per_pixel_ref_sum > params.eps)
+        n_at_floor = int((~valid_factor).sum())
+        if not valid_factor.any():
+            raise RuntimeError(
+                "reference_ion_normalize: no pixel has a usable reference-ion factor."
+            )
+        if n_at_floor and params.missing_reference_policy == "error":
+            raise RuntimeError(
+                f"reference_ion_normalize: {n_at_floor} pixel(s) lack reference signal."
+            )
+        fallback = float(np.median(per_pixel_ref_sum[valid_factor]))
+        factors = np.where(valid_factor, per_pixel_ref_sum, fallback)
 
         for i in range(n_pixels):
             a, b = int(offsets[i]), int(offsets[i + 1])
@@ -274,6 +306,8 @@ class ReferenceIonNormalize(Operator):
                 "factor_q75": float(np.quantile(factors, 0.75)),
                 "factor_max": float(factors.max()),
                 "n_pixels_at_floor": float(n_at_floor),
+                "missing_factor_fraction": float(n_at_floor / max(n_pixels, 1)),
+                "fallback_factor": float(fallback),
                 "n_reference_ions": float(ref.mz.size),
             },
             payload={"per_pixel_factor": factors},

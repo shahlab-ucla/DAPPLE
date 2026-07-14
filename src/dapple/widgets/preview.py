@@ -30,7 +30,7 @@ from dapple.viz.projections import (
     percentile_contrast,
     projection_layer_name,
 )
-from dapple.widgets._session import MsiSession, default_session
+from dapple.widgets._session import MsiSession, adopt_dataset_from_viewer, default_session
 
 if TYPE_CHECKING:
     import napari
@@ -48,6 +48,7 @@ class PreviewWidget(QWidget):
         super().__init__(parent)
         self._viewer = napari_viewer
         self._session = session or default_session()
+        adopt_dataset_from_viewer(self._session, napari_viewer)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(4)

@@ -6,7 +6,8 @@ Usage::
 
 INPUT may be an imzML file, a single .cdf file, or a directory of .cdf files
 (multi-file MSI imaging). SPEC is a ``.spec.xml`` from an earlier run. The
-loaded pipeline runs against INPUT; outputs land at ``OUTPUT_BASE.imzML/.ibd``,
+loaded pipeline runs against INPUT; outputs land at
+``OUTPUT_BASE.imzML/.ibd/.dapple-axis.json`` (for harmonized data),
 ``OUTPUT_BASE.tif`` (+ ``OUTPUT_BASE_channels.csv``), and a fresh
 ``OUTPUT_BASE.spec.xml`` recording this re-run.
 
@@ -43,7 +44,12 @@ from dapple.io.imzml_reader import read_imzml
 from dapple.io.imzml_writer import write_imzml
 from dapple.io.spec_xml import make_provenance, read_spec_xml, write_spec_xml
 from dapple.io.tiff_writer import write_hyperspectral_tiff
-from dapple.pipeline import PipelineRunner, format_diagnostics
+from dapple.pipeline import (
+    Pipeline,
+    PipelineRunner,
+    detect_library_versions,
+    format_diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +103,17 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help=(
-            "Override the RNG seed embedded in the .spec.xml. Useful for "
-            "regenerating bootstrap CIs without re-running every node."
+            "Override the RNG seed embedded in the .spec.xml for a deliberate "
+            "stochastic sensitivity rerun. This command starts with an empty "
+            "cache and executes the pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-rois",
+        action="store_true",
+        help=(
+            "Apply saved ROI coordinates even when the input hash does not match. "
+            "Use only for images already registered to the same pixel geometry."
         ),
     )
     parser.add_argument(
@@ -140,6 +155,26 @@ def _run(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"spec.xml not found: {spec_path}")
 
     pipeline, ep, prov = read_spec_xml(spec_path)
+    recorded_versions = dict(pipeline.library_versions)
+    current_versions = detect_library_versions()
+    changed_versions = {
+        name: (recorded_versions.get(name), current_versions.get(name))
+        for name in sorted(set(recorded_versions) | set(current_versions))
+        if recorded_versions.get(name) != current_versions.get(name)
+    }
+    if changed_versions:
+        print(
+            "warning: runtime library versions differ from the saved spec; "
+            "the fresh manifest will record the current environment:",
+            file=sys.stderr,
+        )
+        for name, (old, new) in changed_versions.items():
+            print(f"  {name}: recorded={old or 'missing'} current={new or 'missing'}", file=sys.stderr)
+    pipeline = Pipeline(
+        nodes=pipeline.nodes,
+        rng_seed=pipeline.rng_seed,
+        library_versions=current_versions,
+    )
     print(
         f"loaded spec {spec_path.name}: pipeline={len(pipeline.nodes)} nodes, "
         f"experiment={ep.instrument_family}/{ep.ionization}/"
@@ -151,6 +186,33 @@ def _run(args: argparse.Namespace) -> int:
 
     print(f"loading input {input_path}...")
     ds = _load_input(input_path)
+    if prov.roi_definitions:
+        candidate = ds.with_rois(prov.roi_definitions)
+        roi_hash_verified = bool(
+            prov.input_dataset_hash
+            and candidate.hash() == prov.input_dataset_hash
+        )
+        if roi_hash_verified:
+            ds = candidate
+            print(
+                f"  restored {len(prov.roi_definitions)} ROI definition(s) "
+                "from hash-matched spec"
+            )
+        elif args.reuse_rois:
+            ds = candidate
+            print(
+                "warning: reusing saved ROI pixel coordinates on an input whose "
+                "hash does not match the spec; this is valid only after explicit "
+                "spatial registration",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "warning: saved ROIs were not restored because the input hash "
+                "does not match the spec. Pass --reuse-rois only if this image is "
+                "registered to the same pixel coordinate system.",
+                file=sys.stderr,
+            )
     print(
         f"  loaded: {ds.n_pixels} pixels, grid {ds.grid_shape}, "
         f"backend={type(ds.backend).__name__}"
@@ -172,6 +234,7 @@ def _run(args: argparse.Namespace) -> int:
 
     # Resolve output base.
     out_base: Path = args.output_base or input_path.parent / (input_path.stem + "_dapple")
+    out_base.parent.mkdir(parents=True, exist_ok=True)
 
     out_files: list[Path] = []
     if not args.no_tiff:
@@ -196,10 +259,12 @@ def _run(args: argparse.Namespace) -> int:
     if not args.no_imzml:
         imzml_path = out_base.with_suffix(".imzML")
         write_result = write_imzml(result.output, imzml_path)
-        out_files.append(write_result.imzml_path)
-        out_files.append(write_result.ibd_path)
+        out_files.extend(write_result.artifact_paths)
+        companions = [write_result.ibd_path.name]
+        if write_result.axis_sidecar_path is not None:
+            companions.append(write_result.axis_sidecar_path.name)
         print(
-            f"wrote {write_result.imzml_path} (+ {write_result.ibd_path.name}); "
+            f"wrote {write_result.imzml_path} (+ {', '.join(companions)}); "
             f"{write_result.n_spectra} spectra / {write_result.total_peaks} peaks"
         )
 
@@ -211,11 +276,12 @@ def _run(args: argparse.Namespace) -> int:
         input_dataset_hash=ds.hash(),
         declared_md5=ds.identity.declared_md5,
         notes=f"re-applied from {spec_path.name}",
+        roi_definitions=ds.rois,
     )
     write_spec_xml(
         new_spec_path,
         pipeline=pipeline,
-        experiment_params=ep,
+        experiment_params=ds.metadata,
         provenance=new_prov,
         diagnostics=result.diagnostics,
     )

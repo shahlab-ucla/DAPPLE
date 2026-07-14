@@ -14,9 +14,9 @@ n_consensus)`` matrix on the *shared* axis. Each dataset retains its own
 pixels and ROIs but they all use the same m/z columns.
 
 This module exposes the algorithm as a function (``align_cohort``) rather than
-a Pipeline operator because the pipeline DAG is currently single-input. A CLI
-(``dapple-cohort-align``) is provided for headless workflows; a future GUI
-"Cohort wizard" page is the natural next addition.
+a Pipeline operator because the pipeline DAG is currently single-input. The
+``dapple-cohort-align`` CLI and napari Cohort harmonization widget provide
+headless and interactive entry points.
 """
 
 from dapple.cohort.align import (

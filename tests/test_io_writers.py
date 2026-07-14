@@ -113,6 +113,38 @@ def test_spec_xml_pipeline_hash_invariant_under_roundtrip(synth_centroided, tmp_
     assert h_orig == h_loaded
 
 
+def test_spec_xml_round_trips_roi_geometry(synth_centroided, tmp_path):
+    from dapple.data.metadata import RoiDef
+
+    _result, pipeline, ds = _aligned_dataset(synth_centroided)
+    rois = (
+        RoiDef(
+            name="early bud",
+            vertices=((0.0, 0.0), (0.0, 2.5), (2.0, 0.0)),
+            color="#123456",
+        ),
+        RoiDef(
+            name="matrix",
+            vertices=((3.0, 3.0), (3.0, 4.0), (4.0, 3.0)),
+            is_background=True,
+        ),
+    )
+    out = tmp_path / "rois.spec.xml"
+    write_spec_xml(
+        out,
+        pipeline=pipeline,
+        experiment_params=ds.metadata,
+        provenance=make_provenance(
+            plugin_version="0.1.0.dev0",
+            input_dataset_hash=ds.hash(),
+            roi_definitions=rois,
+        ),
+    )
+    _, _, provenance = read_spec_xml(out)
+    assert provenance.roi_definitions == rois
+    assert "napari-data-yx-zero-based" in out.read_text(encoding="utf-8")
+
+
 # ---- multipage TIFF ---------------------------------------------------------------
 
 
@@ -206,6 +238,32 @@ def test_imzml_round_trip_peaklist(synth_centroided, tmp_path):
     mz_a, _ = ds.backend.pixel(0)
     mz_b, _ = ds2.backend.pixel(0)
     np.testing.assert_allclose(np.sort(mz_a), np.sort(mz_b), rtol=1e-12)
+
+
+def test_imzml_round_trip_preserves_profile_mode_and_observed_mz_range(
+    synth_centroided, tmp_path
+):
+    """Reader accepts the writer's fileContent-level observed-range terms."""
+    from dataclasses import replace
+
+    ds = read_imzml(synth_centroided)
+    ds = replace(
+        ds,
+        metadata=replace(ds.metadata, profile_or_centroided="profile"),
+    )
+    all_mz = np.asarray(ds.backend.mz[:], dtype=np.float64)
+    expected_min = float(all_mz.min())
+    expected_max = float(all_mz.max())
+
+    written = write_imzml(ds, tmp_path / "profile_roundtrip.imzML")
+    reloaded = read_imzml(written.imzml_path)
+
+    assert reloaded.metadata.profile_or_centroided == "profile"
+    assert reloaded.extra["metadata_source"]["profile_or_centroided"] == "imzml"
+    assert reloaded.metadata.mz_min == pytest.approx(expected_min)
+    assert reloaded.metadata.mz_max == pytest.approx(expected_max)
+    assert reloaded.extra["metadata_source"]["mz_min"] == "imzml"
+    assert reloaded.extra["metadata_source"]["mz_max"] == "imzml"
 
 
 def test_imzml_round_trip_peakmatrix(synth_centroided, tmp_path):

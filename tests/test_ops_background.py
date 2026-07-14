@@ -10,7 +10,11 @@ import pytest
 from dapple.data.dataset import PeakMatrix
 from dapple.data.metadata import RoiDef
 from dapple.io.imzml_reader import read_imzml
-from dapple.ops.background import BackgroundSubtract, BackgroundSubtractParams
+from dapple.ops.background import (
+    BackgroundSubtract,
+    BackgroundSubtractParams,
+    _foreground_background_masks,
+)
 
 
 def _aligned_with_rois(synth_centroided):
@@ -86,6 +90,15 @@ def test_background_subtract_rejects_high_ratio_channels(synth_centroided):
 
 def test_background_subtract_subtract_mode_clips_at_zero(synth_centroided):
     aligned = _aligned_with_rois(synth_centroided)
+    n_channels = aligned.backend.n_peaks
+    aligned = drep(
+        aligned,
+        extra={
+            **aligned.extra,
+            "morans_i_per_channel": np.ones(n_channels),
+            "cohort_prevalence": np.ones(n_channels),
+        },
+    )
     op = BackgroundSubtract()
     rng = np.random.default_rng(0)
     result = op.apply(
@@ -97,6 +110,12 @@ def test_background_subtract_subtract_mode_clips_at_zero(synth_centroided):
     assert (out_matrix >= 0).all()
     # Same channel count as input.
     assert out_matrix.shape == np.asarray(aligned.backend.matrix[:]).shape
+    np.testing.assert_array_equal(
+        result.dataset.extra["consensus_n_peaks_per_channel"],
+        (out_matrix > 0).sum(axis=0),
+    )
+    assert "morans_i_per_channel" not in result.dataset.extra
+    assert "cohort_prevalence" not in result.dataset.extra
 
 
 def test_background_subtract_requires_rois(synth_centroided):
@@ -143,6 +162,71 @@ def test_background_subtract_outside_as_bg_disabled_with_no_bg_roi_errors(synth_
             BackgroundSubtractParams(use_outside_as_bg=False),
             rng=np.random.default_rng(0),
         )
+
+
+def test_overlapping_foreground_rois_are_combined_as_one_class(synth_centroided):
+    aligned = _aligned_with_rois(synth_centroided)
+    first = RoiDef(
+        name="fg_a",
+        vertices=((0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0)),
+    )
+    second = RoiDef(
+        name="fg_b",
+        vertices=((1.0, 1.0), (1.0, 3.0), (3.0, 3.0), (3.0, 1.0)),
+    )
+    ds = drep(aligned, rois=(first, second))
+
+    fg_mask, bg_mask = _foreground_background_masks(
+        ds, use_outside_as_bg=True
+    )
+
+    assert fg_mask.any()
+    assert bg_mask.any()
+    assert not np.any(fg_mask & bg_mask)
+
+
+def test_overlapping_background_rois_are_combined_as_one_class(synth_centroided):
+    aligned = _aligned_with_rois(synth_centroided)
+    foreground = RoiDef(
+        name="fg",
+        vertices=((0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)),
+    )
+    first_bg = RoiDef(
+        name="bg_a",
+        vertices=((2.0, 2.0), (2.0, 4.0), (4.0, 4.0), (4.0, 2.0)),
+        is_background=True,
+    )
+    second_bg = RoiDef(
+        name="bg_b",
+        vertices=((3.0, 2.0), (3.0, 4.0), (4.0, 4.0), (4.0, 2.0)),
+        is_background=True,
+    )
+    ds = drep(aligned, rois=(foreground, first_bg, second_bg))
+
+    fg_mask, bg_mask = _foreground_background_masks(
+        ds, use_outside_as_bg=False
+    )
+
+    assert fg_mask.any()
+    assert bg_mask.any()
+    assert not np.any(fg_mask & bg_mask)
+
+
+def test_cross_class_roi_overlap_is_rejected(synth_centroided):
+    aligned = _aligned_with_rois(synth_centroided)
+    foreground = RoiDef(
+        name="fg",
+        vertices=((0.0, 0.0), (0.0, 3.0), (3.0, 3.0), (3.0, 0.0)),
+    )
+    background = RoiDef(
+        name="bg",
+        vertices=((2.0, 2.0), (2.0, 4.0), (4.0, 4.0), (4.0, 2.0)),
+        is_background=True,
+    )
+    ds = drep(aligned, rois=(foreground, background))
+
+    with pytest.raises(RuntimeError, match="both semantic classes"):
+        _foreground_background_masks(ds, use_outside_as_bg=False)
 
 
 def test_background_subtract_default_params_have_labels_and_help():

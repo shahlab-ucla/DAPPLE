@@ -12,8 +12,9 @@ Flow:
     3. Click **Discover** to pre-flight (lists matching files and their pixel
        counts without running).
     4. Click **Run cohort alignment** — runs on a worker thread, emits live
-       progress, then writes one ``.imzML``/``.tif``/``_channels.csv`` per
-       dataset plus a single ``cohort_summary.json``.
+       progress, then writes one ``.imzML``/``.ibd``/``.dapple-axis.json`` set
+       and one ``.tif``/``_channels.csv`` set per dataset, plus a single
+       ``cohort_summary.json``.
     5. Diagnostics with the same health-check rubric used by ``dapple-apply-spec``
        render in the bottom panel.
 """
@@ -24,12 +25,14 @@ import json
 import logging
 import traceback
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, Sequence, cast
 
-from qtpy.QtCore import QObject, Qt, Signal
+from qtpy.QtCore import QObject, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -49,8 +52,9 @@ from dapple.cohort.align import (
     CohortAlignParams,
     CohortAlignResult,
     align_cohort,
-    load_cohort_directory,
 )
+from dapple.data.dataset import MSIDataset
+from dapple.io.imzml_reader import read_imzml
 from dapple.io.imzml_writer import write_imzml
 from dapple.io.tiff_writer import write_hyperspectral_tiff
 from dapple.pipeline import COHORT_RUBRICS, format_flat_summary
@@ -60,6 +64,85 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _discover_cohort_files(
+    root: Path,
+    *,
+    pattern: str,
+    recursive: bool,
+    exclude_dir: Path | None = None,
+) -> tuple[list[Path], int]:
+    """Discover inputs while excluding prior harmonized outputs."""
+
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(root)
+    files = sorted(root.rglob(pattern) if recursive else root.glob(pattern))
+    excluded = 0
+    if exclude_dir is not None and exclude_dir.resolve() != root:
+        kept = [f for f in files if not _is_within(f, exclude_dir)]
+        excluded = len(files) - len(kept)
+        files = kept
+    # A same-directory workflow cannot exclude the entire output directory.
+    # DAPPLE harmonized imzML files have an axis sidecar and are PeakMatrix
+    # outputs, not valid PeakList cohort inputs, so omit those explicitly.
+    kept = [
+        f for f in files
+        if not f.with_suffix(".dapple-axis.json").is_file()
+    ]
+    excluded += len(files) - len(kept)
+    files = kept
+    if not files:
+        suffix = " after excluding generated/output files" if excluded else ""
+        raise FileNotFoundError(
+            f"no files matching {pattern!r} under {root}{suffix}"
+        )
+    return files, excluded
+
+
+def _load_cohort_files(files: Sequence[Path]) -> list[MSIDataset]:
+    """Load the exact file snapshot accepted during discovery."""
+
+    datasets: list[MSIDataset] = []
+    for path in files:
+        suffix = path.suffix.lower()
+        if suffix in {".imzml", ".ibd"}:
+            datasets.append(read_imzml(path))
+        elif suffix in {".cdf", ".nc"}:
+            from dapple.io.cdf_reader import read_cdf
+
+            datasets.append(read_cdf(path))
+        else:
+            raise ValueError(f"don't know how to load {path}")
+    return datasets
+
+
+def _unique_output_bases(
+    datasets: Sequence[MSIDataset], out_dir: Path
+) -> list[Path]:
+    """Choose deterministic basenames without overwriting duplicate stems."""
+
+    used: set[str] = set()
+    bases: list[Path] = []
+    for index, dataset in enumerate(datasets):
+        stem = Path(dataset.identity.source_path).stem or f"dataset_{index:02d}"
+        candidate = f"{stem}_cohort"
+        suffix = 2
+        while candidate.casefold() in used:
+            candidate = f"{stem}_{suffix}_cohort"
+            suffix += 1
+        used.add(candidate.casefold())
+        bases.append(out_dir / candidate)
+    return bases
 
 
 class _CohortRelay(QObject):
@@ -86,6 +169,8 @@ class CohortWidget(QWidget):
         super().__init__(parent)
         self._viewer = napari_viewer
         self._discovered_files: list[Path] = []
+        self._n_matching_outputs_excluded = 0
+        self._discovery_excluded_dir: Path | None = None
         self._last_result: CohortAlignResult | None = None
         self._worker = None
         self._relay = _CohortRelay(self)
@@ -166,6 +251,27 @@ class CohortWidget(QWidget):
         )
         form.addRow("Bandwidth (ppm):", self._bandwidth_ppm)
 
+        self._pool_weighting_combo = QComboBox()
+        self._pool_weighting_combo.addItem(
+            "Equal weight per dataset (recommended)", "sample"
+        )
+        self._pool_weighting_combo.addItem("Raw pooled intensity", "intensity")
+        self._pool_weighting_combo.setToolTip(
+            "Equal dataset weighting prevents a large or high-intensity sample "
+            "from dominating the shared axis. Raw intensity weighting preserves "
+            "legacy pooled-intensity behavior."
+        )
+        form.addRow("Pool weighting:", self._pool_weighting_combo)
+
+        self._prevalence_basis_combo = QComboBox()
+        self._prevalence_basis_combo.addItem("All cohort pixels", "pixel")
+        self._prevalence_basis_combo.addItem("Datasets carrying the channel", "dataset")
+        self._prevalence_basis_combo.setToolTip(
+            "Choose whether the prevalence threshold counts individual pixels "
+            "or the fraction of datasets in which each channel appears."
+        )
+        form.addRow("Prevalence denominator:", self._prevalence_basis_combo)
+
         self._min_prevalence = QDoubleSpinBox()
         self._min_prevalence.setRange(0.0, 1.0)
         self._min_prevalence.setDecimals(3)
@@ -173,10 +279,10 @@ class CohortWidget(QWidget):
         self._min_prevalence.setValue(0.05)
         self._min_prevalence.setToolTip(
             "Drop shared-axis channels carried by less than this fraction "
-            "of cohort-wide pixels. The cohort default (0.05) is permissive; "
-            "raise to 0.3-0.5 to focus on broadly-shared channels."
+            "of the selected pixel or dataset denominator. The default (0.05) "
+            "is permissive; raise it to focus on broadly shared channels."
         )
-        form.addRow("Min cohort prevalence:", self._min_prevalence)
+        form.addRow("Min prevalence:", self._min_prevalence)
 
         self._min_prominence_q = QDoubleSpinBox()
         self._min_prominence_q.setRange(0.0, 1.0)
@@ -235,6 +341,12 @@ class CohortWidget(QWidget):
         actions.addWidget(self._run_btn)
         outer.addLayout(actions)
 
+        # Input changes invalidate the discover snapshot. Output and alignment
+        # settings can still be changed after discovery without re-reading data.
+        self._root_edit.textChanged.connect(self._invalidate_discovery)
+        self._pattern_edit.textChanged.connect(self._invalidate_discovery)
+        self._recursive_cb.toggled.connect(self._invalidate_discovery)
+
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)  # indeterminate by default
         self._progress.setVisible(False)
@@ -247,6 +359,12 @@ class CohortWidget(QWidget):
         outer.addWidget(self._log, stretch=1)
 
     # --- File-picker handlers ---------------------------------------------------
+
+    def _invalidate_discovery(self, *_args: object) -> None:
+        self._discovered_files = []
+        self._n_matching_outputs_excluded = 0
+        self._discovery_excluded_dir = None
+        self._run_btn.setEnabled(False)
 
     def _on_browse_root(self) -> None:
         p = QFileDialog.getExistingDirectory(self, "Choose cohort root directory")
@@ -265,20 +383,30 @@ class CohortWidget(QWidget):
         if not root:
             QMessageBox.warning(self, "Pick a path", "Enter or browse to a cohort root directory.")
             return
+        self._invalidate_discovery()
         try:
-            datasets = load_cohort_directory(
+            excluded_dir = self._resolve_output_dir()
+            input_files, n_excluded = _discover_cohort_files(
                 Path(root),
                 pattern=self._pattern_edit.text().strip() or "*.imzML",
                 recursive=self._recursive_cb.isChecked(),
+                exclude_dir=excluded_dir,
             )
+            datasets = _load_cohort_files(input_files)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(
                 self, "Discovery failed", f"{e}\n\n{traceback.format_exc()}"
             )
             return
-        self._discovered_files = [Path(d.identity.source_path) for d in datasets]
+        self._discovered_files = list(input_files)
+        self._n_matching_outputs_excluded = n_excluded
+        self._discovery_excluded_dir = excluded_dir
         self._log.clear()
         self._log.append(f"discovered {len(datasets)} dataset(s) under {root}:")
+        if n_excluded:
+            self._log.append(
+                f"  ignored {n_excluded} matching generated/output file(s)"
+            )
         total_pixels = 0
         for i, d in enumerate(datasets):
             name = Path(d.identity.source_path).name
@@ -299,6 +427,12 @@ class CohortWidget(QWidget):
             min_prominence_quantile=float(self._min_prominence_q.value()),
             pool_normalize=self._pool_normalize_cb.isChecked(),
             recalibrate=self._recalibrate_cb.isChecked(),
+            pool_weighting=cast(
+                Literal["sample", "intensity"], self._pool_weighting_combo.currentData()
+            ),
+            prevalence_basis=cast(
+                Literal["pixel", "dataset"], self._prevalence_basis_combo.currentData()
+            ),
             rng_seed=int(self._rng_seed.value()),
         )
 
@@ -339,13 +473,13 @@ class CohortWidget(QWidget):
         files_snapshot = list(self._discovered_files)
         pattern = self._pattern_edit.text().strip() or "*.imzML"
         recursive = self._recursive_cb.isChecked()
-        root = Path(self._root_edit.text().strip())
+        root = Path(self._root_edit.text().strip()).expanduser().resolve()
+        n_excluded = self._n_matching_outputs_excluded
+        excluded_dir = self._discovery_excluded_dir
 
         def _do_work() -> tuple[CohortAlignResult, list[Path]]:
             relay.progress.emit(f"loading {len(files_snapshot)} dataset(s)…")
-            datasets = load_cohort_directory(
-                root, pattern=pattern, recursive=recursive
-            )
+            datasets = _load_cohort_files(files_snapshot)
             relay.progress.emit(
                 f"running per-dataset preprocessing + pooled KDE consensus "
                 f"(this may take a few minutes for large cohorts)…"
@@ -356,13 +490,18 @@ class CohortWidget(QWidget):
             )
             relay.progress.emit("writing outputs…")
             out_dir.mkdir(parents=True, exist_ok=True)
+            output_bases = _unique_output_bases(result.aligned_datasets, out_dir)
             written: list[Path] = []
-            for di, ds in enumerate(result.aligned_datasets):
-                stem = Path(ds.identity.source_path).stem or f"dataset_{di:02d}"
-                base = out_dir / f"{stem}_cohort"
+            dataset_output_files: list[list[str]] = [
+                [] for _ in result.aligned_datasets
+            ]
+            for di, (ds, base) in enumerate(
+                zip(result.aligned_datasets, output_bases)
+            ):
                 if write_tiff_flag:
                     extra = {
                         "cohort_prevalence": result.cohort_prevalence,
+                        "dataset_prevalence": result.dataset_prevalence,
                         "per_dataset_prevalence": result.per_dataset_prevalence[di],
                     }
                     tw = write_hyperspectral_tiff(
@@ -370,18 +509,56 @@ class CohortWidget(QWidget):
                     )
                     written.append(tw.tiff_path)
                     written.append(tw.csv_path)
+                    dataset_output_files[di].extend(
+                        (tw.tiff_path.name, tw.csv_path.name)
+                    )
                     relay.progress.emit(f"  [{di}] wrote {tw.tiff_path.name}")
                 if write_imzml_flag:
                     iw = write_imzml(ds, base.with_suffix(".imzML"))
-                    written.append(iw.imzml_path)
-                    written.append(iw.ibd_path)
-                    relay.progress.emit(f"  [{di}] wrote {iw.imzml_path.name}")
+                    written.extend(iw.artifact_paths)
+                    dataset_output_files[di].extend(
+                        path.name for path in iw.artifact_paths
+                    )
+                    companions = [path.name for path in iw.artifact_paths[1:]]
+                    relay.progress.emit(
+                        f"  [{di}] wrote {iw.imzml_path.name} "
+                        f"(+ {', '.join(companions)})"
+                    )
             # Always write the cohort summary JSON.
             summary_path = out_dir / "cohort_summary.json"
+            selected_prevalence = (
+                result.dataset_prevalence
+                if params.prevalence_basis == "dataset"
+                else result.cohort_prevalence
+            )
             summary_payload = {
+                "summary_schema_version": 2,
+                "created_at_utc": datetime.now(UTC).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "discovery": {
+                    "root": str(root),
+                    "pattern": pattern,
+                    "recursive": bool(recursive),
+                    "input_files": [str(path) for path in files_snapshot],
+                    "output_dir_excluded": (
+                        str(excluded_dir)
+                        if excluded_dir is not None and excluded_dir.resolve() != root
+                        else None
+                    ),
+                    "n_matching_outputs_excluded": n_excluded,
+                },
                 "n_datasets": len(datasets),
+                "n_channels": int(result.shared_consensus_mz.size),
+                "output_files": [path.name for path in written] + [summary_path.name],
                 "shared_consensus_mz": result.shared_consensus_mz.tolist(),
                 "cohort_prevalence": result.cohort_prevalence.tolist(),
+                "dataset_prevalence": result.dataset_prevalence.tolist(),
+                "prevalence_filter": {
+                    "basis": params.prevalence_basis,
+                    "minimum": params.min_prevalence,
+                    "values": selected_prevalence.tolist(),
+                },
                 "per_dataset_prevalence": {
                     str(k): v.tolist() for k, v in result.per_dataset_prevalence.items()
                 },
@@ -389,6 +566,10 @@ class CohortWidget(QWidget):
                     {
                         "index": i,
                         "source_path": str(d.identity.source_path),
+                        "content_sha256": d.identity.content_sha256,
+                        "declared_md5": d.identity.declared_md5,
+                        "output_basename": output_bases[i].name,
+                        "output_files": dataset_output_files[i],
                         "n_pixels": int(d.n_pixels),
                         "grid_shape": list(d.grid_shape),
                         "instrument_family": d.metadata.instrument_family,
@@ -450,7 +631,7 @@ class CohortWidget(QWidget):
         QMessageBox.critical(self, "Cohort alignment failed", msg)
 
     def _on_worker_done(self) -> None:
-        self._run_btn.setEnabled(True)
+        self._run_btn.setEnabled(bool(self._discovered_files))
         self._discover_btn.setEnabled(True)
         self._progress.setVisible(False)
 

@@ -47,7 +47,7 @@ def write_hyperspectral_tiff(
     """Write the dataset's PeakMatrix to a multipage float32 TIFF + CSV sidecar.
 
     `extra_per_channel` lets callers attach extra columns to the CSV / TIFF metadata
-    (e.g. Moran's I p-values from a future spatial-filter operator). Each value must
+    (e.g. Moran's I values or cohort dataset prevalence). Each value must
     be a 1-D array of length `n_peaks`.
     """
     if not isinstance(ds.backend, PeakMatrix):

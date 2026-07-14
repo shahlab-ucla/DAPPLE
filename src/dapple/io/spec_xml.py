@@ -4,13 +4,13 @@ A `.spec.xml` captures everything needed to reapply a pipeline to a new dataset:
 - provenance (timestamp, plugin version, library versions, input dataset SHA-256)
 - the source ExperimentParams
 - the full pipeline DAG with operator names and parameters
-- a flat scalar-only diagnostics summary (heavy diagnostic payloads stay out — they
-  belong in a sibling Zarr if persisted)
+- a flat scalar-only diagnostics summary (heavy diagnostic payloads are not persisted)
 
 The XML is human-readable and validates against `spec_xml.xsd` (currently a permissive
 placeholder; a strict per-element schema is planned). The format is designed so
-that `read_spec_xml(write_spec_xml(p)) == p` round-trips semantically, and `apply_spec`
-can take the XML plus an input dataset and produce identical output.
+that `read_spec_xml(write_spec_xml(p)) == p` round-trips semantically. ``apply_spec``
+replays the declared workflow and records current library versions; numerical output
+can still differ when libraries, platforms, or the input dataset differ.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 from lxml import etree
 
-from dapple.data.metadata import ExperimentParams
+from dapple.data.metadata import ExperimentParams, RoiDef
 from dapple.ops.base import REGISTRY, Diagnostic, OpParams
 from dapple.pipeline.pipeline import Node, Pipeline
 
@@ -41,6 +41,7 @@ class ProvenanceInfo:
     input_dataset_hash: str | None = None
     declared_md5: str | None = None
     notes: str = ""
+    roi_definitions: tuple[RoiDef, ...] = ()
 
 
 def write_spec_xml(
@@ -53,12 +54,14 @@ def write_spec_xml(
 ) -> Path:
     """Serialize a Pipeline + ExperimentParams + provenance + diagnostics to XML.
 
-    Returns the path written. Diagnostic payloads (numpy arrays) are NOT serialized;
-    only scalar summaries are. Persist payloads to a sibling Zarr if you need them.
+    Returns the path written. Diagnostic payloads (numpy arrays) are not serialized;
+    only scalar summaries are currently part of the format.
     """
     root = etree.Element("spec", nsmap=NSMAP, attrib={"version": SPEC_VERSION})
     _append_provenance(root, provenance, pipeline.library_versions)
     _append_experiment_params(root, experiment_params)
+    if provenance.roi_definitions:
+        _append_spatial_definitions(root, provenance.roi_definitions)
     _append_pipeline(root, pipeline)
     if diagnostics:
         _append_diagnostics_summary(root, diagnostics)
@@ -101,6 +104,7 @@ def make_provenance(
     input_dataset_hash: str | None,
     declared_md5: str | None = None,
     notes: str = "",
+    roi_definitions: tuple[RoiDef, ...] = (),
     timestamp: _dt.datetime | None = None,
 ) -> ProvenanceInfo:
     ts = timestamp or _dt.datetime.now(tz=_dt.UTC)
@@ -110,6 +114,7 @@ def make_provenance(
         input_dataset_hash=input_dataset_hash,
         declared_md5=declared_md5,
         notes=notes,
+        roi_definitions=tuple(roi_definitions),
     )
 
 
@@ -143,6 +148,33 @@ def _append_experiment_params(root: etree._Element, ep: ExperimentParams) -> Non
             continue
         sub = etree.SubElement(el, f.name)
         sub.text = str(val)
+
+
+def _append_spatial_definitions(
+    root: etree._Element, rois: tuple[RoiDef, ...]
+) -> None:
+    """Persist ROI geometry needed by background-aware operators."""
+    el = etree.SubElement(
+        root,
+        "spatialDefinitions",
+        attrib={"coordinateSystem": "napari-data-yx-zero-based"},
+    )
+    for roi in rois:
+        roi_el = etree.SubElement(
+            el,
+            "roi",
+            attrib={
+                "name": roi.name,
+                "isBackground": "true" if roi.is_background else "false",
+                "color": roi.color,
+            },
+        )
+        for y, x in roi.vertices:
+            etree.SubElement(
+                roi_el,
+                "vertex",
+                attrib={"y": repr(float(y)), "x": repr(float(x))},
+            )
 
 
 def _append_pipeline(root: etree._Element, pipeline: Pipeline) -> None:
@@ -232,13 +264,45 @@ def _parse_provenance(root: etree._Element) -> ProvenanceInfo:
     input_hash = (el.findtext(_ns("inputDatasetHash")) or "").strip() or None
     declared_md5 = (el.findtext(_ns("ibdHash")) or "").strip() or None
     notes = (el.findtext(_ns("notes")) or "").strip()
+    rois = _parse_spatial_definitions(root)
     return ProvenanceInfo(
         created_at=created_at,
         plugin_version=plugin_version,
         input_dataset_hash=input_hash,
         declared_md5=declared_md5,
         notes=notes,
+        roi_definitions=rois,
     )
+
+
+def _parse_spatial_definitions(root: etree._Element) -> tuple[RoiDef, ...]:
+    el = root.find(_ns("spatialDefinitions"))
+    if el is None:
+        return ()
+    coordinate_system = el.get("coordinateSystem")
+    if coordinate_system != "napari-data-yx-zero-based":
+        raise ValueError(
+            "unsupported spatialDefinitions coordinateSystem "
+            f"{coordinate_system!r}"
+        )
+    rois: list[RoiDef] = []
+    for roi_el in el.findall(_ns("roi")):
+        vertices: list[tuple[float, float]] = []
+        for vertex in roi_el.findall(_ns("vertex")):
+            try:
+                vertices.append((float(vertex.get("y")), float(vertex.get("x"))))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid ROI vertex in spatialDefinitions") from exc
+        rois.append(
+            RoiDef(
+                name=roi_el.get("name") or f"ROI {len(rois) + 1}",
+                vertices=tuple(vertices),
+                is_background=(roi_el.get("isBackground") or "false").lower()
+                in {"true", "1", "yes"},
+                color=roi_el.get("color") or "#ff7f0e",
+            )
+        )
+    return tuple(rois)
 
 
 def _parse_library_versions(root: etree._Element) -> dict[str, str]:

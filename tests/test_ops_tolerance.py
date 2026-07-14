@@ -55,6 +55,26 @@ def test_empirical_tolerance_ci_band_is_non_negative(synth_centroided):
     assert (curve.ci_high >= curve.ci_low).all()
 
 
+def test_stochastic_output_state_changes_dataset_hash(synth_centroided):
+    """Direct calls with different RNG streams cannot alias in provenance/cache state."""
+    ds = read_imzml(synth_centroided)
+    ref_op = DetectReferenceIons()
+    with_refs = ref_op.apply(
+        ds, ref_op.default_params(ds.metadata), rng=np.random.default_rng(0)
+    ).dataset
+    op = EmpiricalToleranceFromReferenceIons()
+    params = EmpiricalToleranceParams(
+        alpha=0.01, bootstrap_B=30, block_bootstrap=False
+    )
+    a = op.apply(with_refs, params, rng=np.random.default_rng(10)).dataset
+    b = op.apply(with_refs, params, rng=np.random.default_rng(11)).dataset
+    assert not np.array_equal(
+        a.extra["tolerance_curve"].ci_low,
+        b.extra["tolerance_curve"].ci_low,
+    )
+    assert a.hash() != b.hash()
+
+
 def test_empirical_tolerance_evaluate_interpolates(synth_centroided):
     ds = read_imzml(synth_centroided)
     result = _run_with_refs(ds)

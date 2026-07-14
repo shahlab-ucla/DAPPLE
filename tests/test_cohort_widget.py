@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,7 +36,86 @@ def test_cohort_widget_constructs(qtbot, viewer):
     w = CohortWidget(napari_viewer=viewer)
     qtbot.addWidget(w)
     assert w._root_edit.text() == ""  # noqa: SLF001
+    assert w._pool_weighting_combo.currentData() == "sample"  # noqa: SLF001
+    assert w._prevalence_basis_combo.currentData() == "pixel"  # noqa: SLF001
     assert not w._run_btn.isEnabled()  # noqa: SLF001 — locked until Discover succeeds
+
+
+def test_cohort_widget_builds_weighting_and_prevalence_params(qtbot, viewer):
+    from dapple.widgets.cohort import CohortWidget
+
+    w = CohortWidget(napari_viewer=viewer)
+    qtbot.addWidget(w)
+    w._pool_weighting_combo.setCurrentIndex(  # noqa: SLF001
+        w._pool_weighting_combo.findData("intensity")  # noqa: SLF001
+    )
+    w._prevalence_basis_combo.setCurrentIndex(  # noqa: SLF001
+        w._prevalence_basis_combo.findData("dataset")  # noqa: SLF001
+    )
+
+    params = w._build_params()  # noqa: SLF001
+
+    assert params.pool_weighting == "intensity"
+    assert params.prevalence_basis == "dataset"
+
+
+def test_widget_output_bases_are_collision_safe(tmp_path):
+    from dapple.widgets.cohort import _unique_output_bases
+
+    datasets = [
+        SimpleNamespace(identity=SimpleNamespace(source_path="one/sample.imzML")),
+        SimpleNamespace(identity=SimpleNamespace(source_path="two/sample.imzML")),
+    ]
+
+    bases = _unique_output_bases(datasets, tmp_path)
+
+    assert [base.name for base in bases] == ["sample_cohort", "sample_2_cohort"]
+
+
+def test_widget_discovery_excludes_nested_output_directory(tmp_path):
+    from dapple.widgets.cohort import _discover_cohort_files
+
+    root = tmp_path / "cohort"
+    out = root / "dapple_cohort"
+    out.mkdir(parents=True)
+    source = root / "source.imzML"
+    generated = out / "source_cohort.imzML"
+    source.touch()
+    generated.touch()
+
+    files, n_excluded = _discover_cohort_files(
+        root,
+        pattern="*.imzML",
+        recursive=True,
+        exclude_dir=out,
+    )
+
+    assert files == [source]
+    assert n_excluded == 1
+
+
+def test_widget_discovery_excludes_harmonized_outputs_when_output_is_root(tmp_path):
+    from dapple.widgets.cohort import _discover_cohort_files
+
+    root = tmp_path / "cohort"
+    root.mkdir()
+    source = root / "source.imzML"
+    generated = root / "source_cohort.imzML"
+    source.touch()
+    generated.touch()
+    generated.with_suffix(".dapple-axis.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    files, n_excluded = _discover_cohort_files(
+        root,
+        pattern="*.imzML",
+        recursive=False,
+        exclude_dir=root,
+    )
+
+    assert files == [source]
+    assert n_excluded == 1
 
 
 def test_discover_lists_files(qtbot, viewer, synth_centroided, tmp_path):
@@ -84,6 +164,12 @@ def test_run_writes_outputs_and_renders_diagnostics(qtbot, viewer, synth_centroi
     w._bandwidth_ppm.setValue(20.0)  # noqa: SLF001
     w._min_prevalence.setValue(0.5)  # noqa: SLF001
     w._recalibrate_cb.setChecked(False)  # noqa: SLF001 — keep test fast
+    w._pool_weighting_combo.setCurrentIndex(  # noqa: SLF001
+        w._pool_weighting_combo.findData("intensity")  # noqa: SLF001
+    )
+    w._prevalence_basis_combo.setCurrentIndex(  # noqa: SLF001
+        w._prevalence_basis_combo.findData("dataset")  # noqa: SLF001
+    )
     w._on_discover()  # noqa: SLF001
     assert w._run_btn.isEnabled()  # noqa: SLF001
 
@@ -106,15 +192,29 @@ def test_run_writes_outputs_and_renders_diagnostics(qtbot, viewer, synth_centroi
     summary = json.loads((out / "cohort_summary.json").read_text(encoding="utf-8"))
     assert summary["n_datasets"] == 2
     assert len(summary["shared_consensus_mz"]) >= 5
+    assert len(summary["dataset_prevalence"]) == len(summary["shared_consensus_mz"])
+    assert summary["params"]["pool_weighting"] == "intensity"
+    assert summary["params"]["prevalence_basis"] == "dataset"
+    assert summary["prevalence_filter"]["basis"] == "dataset"
+    assert summary["summary_schema_version"] == 2
+    assert len(summary["output_files"]) == 11
+    assert "a_cohort.dapple-axis.json" in summary["output_files"]
+    assert all("output_files" in item for item in summary["datasets"])
     assert (out / "a_cohort.tif").exists()
     assert (out / "b_cohort.tif").exists()
+    assert "dataset_prevalence" in (
+        out / "a_cohort_channels.csv"
+    ).read_text(encoding="utf-8").splitlines()[0]
     assert (out / "a_cohort.imzML").exists()
     assert (out / "b_cohort.imzML").exists()
+    assert (out / "a_cohort.dapple-axis.json").exists()
+    assert (out / "b_cohort.dapple-axis.json").exists()
 
     # Log contains the rubric-graded diagnostic block.
     log = w._log.toPlainText()  # noqa: SLF001
     assert "Cohort alignment diagnostics" in log
     assert "shared consensus channels" in log
+    assert "11 output file(s) written" in log
     # The widget exposes the result for downstream use.
     assert w.last_result is not None
     assert w.last_result.shared_consensus_mz.size >= 5

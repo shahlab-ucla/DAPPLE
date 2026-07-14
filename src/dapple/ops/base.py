@@ -7,7 +7,7 @@ parameter dataclass and name are hashable into the pipeline DAG.
 
 Every operator emits at least one diagnostic. Diagnostics carry a scalar summary dict
 (persisted in `.spec.xml` and rendered in the wizard's RunPage) and an optional payload
-dict of arrays (persisted to a sibling Zarr).
+dict of arrays (available in the live run result but not currently persisted).
 """
 
 from __future__ import annotations
@@ -60,6 +60,10 @@ class Operator(ABC):
 
     name: ClassVar[str]
     params_cls: ClassVar[type[OpParams]]
+    # Override only when ``apply`` reads ``ds.rois``.  The runner can then keep
+    # expensive upstream results cached while still invalidating the dependent
+    # operation after ROI edits.
+    depends_on_rois: ClassVar[bool] = False
 
     @abstractmethod
     def apply(
@@ -153,14 +157,16 @@ def merge_op_record(
     from dapple.data.hashing import hash_obj
 
     libs = lib_versions or {}
-    output_hash = hash_op_result_inputs(op_name, params, input_ds.hash(), libs)
+    op_cls = REGISTRY.get(op_name)
+    input_hash = input_ds.hash(include_rois=op_cls.depends_on_rois)
+    output_hash = hash_op_result_inputs(op_name, params, input_hash, libs)
     # Defensive use of output_ds to avoid unused-var lint complaints; future versions
     # may incorporate output_ds backend hashes too.
     _ = output_ds
     return OpRecord(
         op_name=op_name,
         params_hash=hash_obj(params),
-        input_hash=input_ds.hash(),
+        input_hash=input_hash,
         output_hash=output_hash,
         diagnostics_summary=diagnostic_summary_tuple(diagnostics),
     )

@@ -41,7 +41,9 @@ def test_detect_reference_ions_appends_history(synth_centroided):
     assert len(result.dataset.history) == 1
     record = result.dataset.history[0]
     assert record.op_name == "detect_reference_ions"
-    assert record.input_hash == ds.hash()
+    # Reference detection does not consume ROI geometry, so its cache/provenance
+    # fingerprint intentionally ignores annotations.
+    assert record.input_hash == ds.hash(include_rois=False)
     assert record.output_hash != record.input_hash
     assert any(d.name == "detect_reference_ions" for d in result.diagnostics)
 

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 
 from psygnal import Signal
 
+from dapple.data.dataset import PeakList
+
 if TYPE_CHECKING:
     from dapple.data.dataset import MSIDataset
     from dapple.data.metadata import RoiDef
@@ -33,6 +35,7 @@ class MsiSession:
 
     def __init__(self) -> None:
         self._dataset: "MSIDataset | None" = None
+        self._raw_dataset: "MSIDataset | None" = None
         self._selected_pixel: tuple[int, int] | None = None
         self._selected_roi: str | None = None
         self._rois: tuple["RoiDef", ...] = ()
@@ -42,7 +45,20 @@ class MsiSession:
     def dataset(self) -> "MSIDataset | None":
         return self._dataset
 
+    @property
+    def raw_dataset(self) -> "MSIDataset | None":
+        """Original peak-list dataset retained for before/after inspection."""
+        return self._raw_dataset
+
     def set_dataset(self, ds: "MSIDataset | None") -> None:
+        previous_raw = self._raw_dataset
+        if ds is None:
+            self._raw_dataset = None
+        elif isinstance(ds.backend, PeakList):
+            self._raw_dataset = ds
+        elif previous_raw is not None and previous_raw.identity != ds.identity:
+            # Opening an unrelated processed file must not retain a stale raw trace.
+            self._raw_dataset = None
         self._dataset = ds
         if ds is not None:
             self._rois = ds.rois
@@ -77,6 +93,8 @@ class MsiSession:
         self._rois = rois
         if self._dataset is not None:
             self._dataset = self._dataset.with_rois(rois)
+        if self._raw_dataset is not None:
+            self._raw_dataset = self._raw_dataset.with_rois(rois)
         self.rois_changed.emit(rois)
 
     # --- show-m/z request -------------------------------------------------------
@@ -97,3 +115,36 @@ def default_session() -> MsiSession:
     if _DEFAULT_SESSION is None:
         _DEFAULT_SESSION = MsiSession()
     return _DEFAULT_SESSION
+
+
+def adopt_dataset_from_viewer(session: MsiSession, viewer: object | None) -> bool:
+    """Adopt an MSI dataset already attached to a napari layer.
+
+    Reader contributions put the originating :class:`MSIDataset` in layer metadata.
+    Standalone widgets used to ignore that state, so opening an imzML file directly
+    and then opening Channels/Spectrum still showed "no dataset loaded".  Prefer the
+    active layer, then scan newest-to-oldest, and never replace an explicit session.
+    """
+    if session.dataset is not None or viewer is None:
+        return session.dataset is not None
+    layers = getattr(viewer, "layers", None)
+    if layers is None:
+        return False
+    candidates: list[object] = []
+    try:
+        active = layers.selection.active
+        if active is not None:
+            candidates.append(active)
+    except Exception:  # noqa: BLE001 — napari API varies across minor versions
+        pass
+    try:
+        candidates.extend(layer for layer in reversed(list(layers)) if layer not in candidates)
+    except Exception:  # noqa: BLE001
+        return False
+    for layer in candidates:
+        metadata = getattr(layer, "metadata", None) or {}
+        ds = metadata.get("msi_dataset") if isinstance(metadata, dict) else None
+        if ds is not None:
+            session.set_dataset(ds)
+            return True
+    return False

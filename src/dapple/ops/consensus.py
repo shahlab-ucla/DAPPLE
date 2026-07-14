@@ -4,7 +4,7 @@ Algorithm: pool all picked peaks across pixels, fit a 1-D Gaussian KDE on log(m/
 with a ppm-scaled bandwidth, call local maxima of the KDE as consensus peaks, then
 for each consensus m/z extract per-pixel intensity (the most intense peak in the
 tolerance window). A simple prevalence floor drops peaks observed in fewer than
-``min_prevalence`` of pixels; a permutation-FDR alternative is planned.
+``min_prevalence`` of pixels.
 
 Output is an MSIDataset with a PeakMatrix backend keyed by the consensus m/z axis,
 which is what the channels panel and TIFF writer consume.
@@ -33,8 +33,8 @@ from dapple.ops.tolerance import ToleranceCurve
 class KdeConsensusParams(OpParams):
     """Parameters for KDE-based consensus alignment.
 
-    `n_grid_points` — m/z grid resolution for KDE evaluation. Default 32768 → ~21 ppm
-        spacing across a 200–800 m/z range, fine enough not to bias peak detection.
+    `n_grid_points` — minimum m/z grid resolution for KDE evaluation. The effective
+        grid is refined automatically to sample the requested bandwidth.
     `bandwidth_ppm` — Gaussian KDE bandwidth in ppm. The natural bandwidth for MSI is
         the per-peak m/z scatter (which is also the recalibration tolerance), NOT the
         Silverman rule (which derives a bandwidth from the *full* m/z range and
@@ -46,8 +46,7 @@ class KdeConsensusParams(OpParams):
     `default_tol_ppm` — fallback tolerance window when no `tolerance_curve` is in
         ds.extra. Used to assign per-pixel peaks to consensus m/z bins.
     `min_prevalence` — drop consensus peaks present in fewer than this fraction of
-        pixels (a simple, conservative prevalence filter; a permutation-FDR
-        alternative is planned).
+        pixels (a simple, conservative prevalence filter).
     """
 
     n_grid_points: int = field(
@@ -55,10 +54,10 @@ class KdeConsensusParams(OpParams):
         metadata={
             "label": "KDE grid resolution",
             "help": (
-                "Number of evaluation points for the m/z density. Default 32768 gives "
-                "~21 ppm spacing across a 200–800 m/z range — fine enough not to bias "
-                "peak detection. More = sharper peak detection but slower; less = "
-                "faster but risks merging close peaks."
+                "Minimum number of evaluation points for the m/z density. DAPPLE "
+                "automatically refines this to at least four samples per KDE "
+                "bandwidth (capped at two million points), which prevents a 5 ppm "
+                "Orbitrap bandwidth from being evaluated on a much coarser grid."
             ),
         },
     )
@@ -120,10 +119,23 @@ class KdeConsensusParams(OpParams):
                 "Conservative prevalence floor: discard consensus peaks observed in "
                 "fewer than this fraction of pixels. Default 0.05 (5%). Raise toward "
                 "0.2 to be strict and only keep widespread peaks; lower to keep "
-                "rare-but-real signals. A permutation-FDR alternative is planned."
+                "rare-but-real signals. For developmental studies, prefer cohort "
+                "dataset prevalence when stage-local features must remain visible."
             ),
         },
     )
+
+    def __post_init__(self) -> None:
+        if self.n_grid_points < 3:
+            raise ValueError("n_grid_points must be at least 3")
+        if self.bandwidth_ppm <= 0 or self.bandwidth_scale <= 0:
+            raise ValueError("bandwidth_ppm and bandwidth_scale must be positive")
+        if not 0.0 <= self.min_prominence_quantile <= 1.0:
+            raise ValueError("min_prominence_quantile must be in [0, 1]")
+        if self.default_tol_ppm <= 0:
+            raise ValueError("default_tol_ppm must be positive")
+        if not 0.0 <= self.min_prevalence <= 1.0:
+            raise ValueError("min_prevalence must be in [0, 1]")
 
 
 @register
@@ -176,12 +188,11 @@ class KdeConsensusAlignment(Operator):
         # Evaluate KDE on a fine grid in log-m/z space. Extend the grid past the data
         # range by 5 * bandwidth so boundary peaks aren't underestimated by the kernel
         # spilling over the edge.
-        pad = 5.0 * bw
-        log_lo = float(log_mz.min()) - pad
-        log_hi = float(log_mz.max()) + pad
-        if log_hi <= log_lo:
-            log_hi = log_lo + 1e-6
-        grid_log = np.linspace(log_lo, log_hi, num=int(params.n_grid_points))
+        grid_log, grid_was_capped = _adaptive_kde_grid(
+            log_mz,
+            bw,
+            minimum_points=int(params.n_grid_points),
+        )
         density = _kde_eval_1d(log_mz, weights, grid_log, bw)
 
         # ---- Find ALL local maxima first (rejection-budget recording), then filter
@@ -190,7 +201,13 @@ class KdeConsensusAlignment(Operator):
         # ---- if I raised min_prominence_quantile to X?" without re-running KDE.
         all_max_idx = _local_maxima(density, threshold=-np.inf)
         all_max_density = density[all_max_idx] if all_max_idx.size else np.empty(0)
-        prominence_thr = float(np.quantile(density, params.min_prominence_quantile))
+        positive_density = density[density > 0]
+        prominence_thr = float(
+            np.quantile(
+                positive_density if positive_density.size else density,
+                params.min_prominence_quantile,
+            )
+        )
         prominence_keep = all_max_density > prominence_thr
         candidate_idx = all_max_idx[prominence_keep] if all_max_idx.size else all_max_idx
         n_rejected_by_prominence = int((~prominence_keep).sum()) if all_max_idx.size else 0
@@ -207,23 +224,6 @@ class KdeConsensusAlignment(Operator):
         else:
             consensus_tol_ppm = np.full(candidate_mz.size, params.default_tol_ppm)
 
-        # Vectorized assignment: a peak with m/z m belongs to consensus i iff
-        #   m in [c_i * (1 - tol_i*1e-6), c_i * (1 + tol_i*1e-6)]
-        # We do this via searchsorted on sorted candidate_mz; ranges may overlap.
-        order = np.argsort(candidate_mz)
-        candidate_mz_sorted = candidate_mz[order]
-        consensus_tol_sorted = consensus_tol_ppm[order]
-        lo = candidate_mz_sorted * (1 - consensus_tol_sorted * 1e-6)
-        hi = candidate_mz_sorted * (1 + consensus_tol_sorted * 1e-6)
-
-        # For each peak, find candidate(s) whose window contains it. Use searchsorted.
-        # left = smallest i with candidate_mz_sorted[i] - tol >= peak_mz means peak is
-        # below i's range ⇒ i is candidate iff peak in [lo[i-1], hi[i-1]]. Easier:
-        # find i = searchsorted(candidate_mz_sorted, peak_mz). The peak's nearest
-        # consensus is candidate_mz_sorted[i-1] or [i]; check both.
-        idx_right = np.searchsorted(candidate_mz_sorted, peak_mz)
-        idx_left = idx_right - 1
-
         # Intensity matrix: (n_pixels, n_consensus). Take MAX intensity per (pixel, c).
         n_consensus = candidate_mz.size
         n_pixels = ds.n_pixels
@@ -232,31 +232,25 @@ class KdeConsensusAlignment(Operator):
         # how many pre-aggregation peaks landed in each consensus channel across
         # the image. Distinct from ``prevalence`` (which counts distinct pixels)
         # and from ``matrix > 0`` (which max-aggregates to one cell per pixel).
-        # The PrevalenceFdrFilter operator uses this as the null-model's ball
-        # count: "if these k_c peaks were placed uniformly at random across
-        # n_pixels bins, would we expect to see this prevalence?"
+        # The optional experimental prevalence sensitivity filter uses this as
+        # its occupancy-model ball count. That model is intentionally disabled
+        # by default and reports an explicit calibration warning.
         n_peaks_per_channel = np.zeros(n_consensus, dtype=np.int64)
 
-        # Build flat (pixel, consensus_idx, intensity) triples for both neighbor
-        # candidates, then keep the max per (pixel, consensus).
-        for which in (idx_left, idx_right):
-            valid = (which >= 0) & (which < n_consensus)
-            if not valid.any():
-                continue
-            sel = which[valid]
-            sel_peak_mz = peak_mz[valid]
-            sel_peak_pix = peak_pixel[valid]
-            sel_peak_int = peak_int[valid]
-            in_window = (sel_peak_mz >= lo[sel]) & (sel_peak_mz <= hi[sel])
-            if not in_window.any():
-                continue
-            sel = sel[in_window]
-            sel_peak_pix = sel_peak_pix[in_window]
-            sel_peak_int = sel_peak_int[in_window]
-            sorted_consensus = order[sel]  # back to original consensus indexing
-            # Maximum-aggregate. Use scatter via np.maximum.at for correctness.
-            np.maximum.at(matrix, (sel_peak_pix, sorted_consensus), sel_peak_int)
-            np.add.at(n_peaks_per_channel, sorted_consensus, 1)
+        # Assign each input peak to at most one channel.  The previous left+right
+        # scatter duplicated a peak into both channels whenever tolerance windows
+        # overlapped, inflating prevalence and creating correlated duplicates.
+        peak_idx, consensus_idx = _nearest_window_assignments(
+            peak_mz,
+            candidate_mz,
+            consensus_tol_ppm,
+        )
+        np.maximum.at(
+            matrix,
+            (peak_pixel[peak_idx], consensus_idx),
+            peak_int[peak_idx],
+        )
+        np.add.at(n_peaks_per_channel, consensus_idx, 1)
 
         # ---- Prevalence filter ----
         prevalence = (matrix > 0).sum(axis=0) / n_pixels
@@ -292,7 +286,7 @@ class KdeConsensusAlignment(Operator):
         new_ds = ds.with_backend(peakmatrix)
         # Attach prevalence vector for the HyperspectralBrowser to display.
         # `consensus_n_peaks_per_channel` is the total count of (peak, pixel)
-        # assignments per channel — needed by PrevalenceFdrFilter's null model.
+        # assignments per channel, retained for diagnostics and sensitivity work.
         new_extra = {
             **ds.extra,
             "consensus_prevalence": kept_prev.astype(np.float64, copy=False),
@@ -326,6 +320,11 @@ class KdeConsensusAlignment(Operator):
                 "prevalence_max": float(kept_prev.max()),
                 # Operating point
                 "bandwidth_log_mz": float(bw),
+                "kde_grid_points": float(grid_log.size),
+                "kde_grid_step_ppm": float(
+                    (grid_log[1] - grid_log[0]) * 1e6 if grid_log.size > 1 else 0.0
+                ),
+                "kde_grid_capped": float(grid_was_capped),
                 "min_prominence_quantile": float(params.min_prominence_quantile),
                 "min_prevalence_threshold": float(params.min_prevalence),
             },
@@ -343,8 +342,8 @@ class KdeConsensusAlignment(Operator):
                 "all_candidate_prevalence": all_candidate_prevalence.astype(np.float64, copy=False),
                 "all_candidate_max_intensity": all_candidate_max_intensity,
                 # KDE curve (for the line plot).
-                "kde_grid_log_mz": grid_log,
-                "kde_density": density,
+                "kde_grid_log_mz": _downsample_for_diagnostics(grid_log),
+                "kde_density": _downsample_for_diagnostics(density),
             },
             figure_hint="line:kde_density_with_consensus_marks",
         )
@@ -360,35 +359,104 @@ class KdeConsensusAlignment(Operator):
 
 
 def _kde_eval_1d(x: np.ndarray, w: np.ndarray, grid: np.ndarray, bw: float) -> np.ndarray:
-    """Weighted Gaussian KDE evaluated on a 1-D grid. O(n + g log n) via sort & sweep
-    over the truncated kernel support (±5σ).
+    """Approximate a weighted 1-D Gaussian KDE in ``O(n + g)``.
 
-    We avoid scipy.stats.gaussian_kde because it doesn't support weighted samples in
-    older scipy and is also O(n*g) which gets painful at n ~ 200k, g ~ 8192.
+    Samples are linearly deposited into a uniform histogram and convolved with a
+    Gaussian.  This replaces the former Python loop over every grid point; with an
+    adaptive million-point high-resolution grid it is both faster and far more
+    accurate than evaluating a 5 ppm bandwidth on 30–70 ppm grid spacing.
     """
-    if x.size == 0:
+    from scipy.ndimage import gaussian_filter1d
+
+    if x.size == 0 or grid.size == 0:
         return np.zeros_like(grid)
-    inv_bw = 1.0 / bw
-    out = np.zeros_like(grid, dtype=np.float64)
-    # Sort samples once.
-    order = np.argsort(x)
-    xs = x[order]
-    ws = w[order]
-    # For each sample, Gaussian contribution is non-negligible within ±cutoff*bw.
-    cutoff = 5.0
-    # For each grid point, find sample range [lo, hi) within cutoff*bw of grid value.
-    los = np.searchsorted(xs, grid - cutoff * bw, side="left")
-    his = np.searchsorted(xs, grid + cutoff * bw, side="right")
-    # Vectorized inner loop is hard with variable-length slices; use a Python loop.
-    norm = 1.0 / (np.sqrt(2.0 * np.pi) * bw * w.sum())
-    for gi in range(grid.size):
-        lo = int(los[gi])
-        hi = int(his[gi])
-        if hi <= lo:
-            continue
-        diffs = (grid[gi] - xs[lo:hi]) * inv_bw
-        out[gi] = (ws[lo:hi] * np.exp(-0.5 * diffs * diffs)).sum()
-    return out * norm
+    if grid.size == 1:
+        return np.asarray([float(np.maximum(w, 0).sum())], dtype=np.float64)
+    step = float(grid[1] - grid[0])
+    if step <= 0 or not np.allclose(np.diff(grid), step, rtol=1e-7, atol=1e-15):
+        raise ValueError("KDE grid must be uniformly increasing")
+    weights = np.maximum(np.asarray(w, dtype=np.float64), 0.0)
+    total_weight = float(weights.sum())
+    if total_weight <= 0:
+        return np.zeros_like(grid, dtype=np.float64)
+    position = (np.asarray(x, dtype=np.float64) - float(grid[0])) / step
+    left = np.floor(position).astype(np.int64)
+    fraction = position - left
+    hist = np.zeros(grid.size, dtype=np.float64)
+    valid_left = (left >= 0) & (left < grid.size)
+    np.add.at(hist, left[valid_left], weights[valid_left] * (1.0 - fraction[valid_left]))
+    right = left + 1
+    valid_right = (right >= 0) & (right < grid.size)
+    np.add.at(hist, right[valid_right], weights[valid_right] * fraction[valid_right])
+    smoothed = gaussian_filter1d(
+        hist,
+        sigma=max(float(bw / step), 0.5),
+        mode="constant",
+        truncate=5.0,
+    )
+    return smoothed / (total_weight * step)
+
+
+def _adaptive_kde_grid(
+    log_mz: np.ndarray,
+    bw: float,
+    *,
+    minimum_points: int,
+    points_per_bandwidth: float = 4.0,
+    max_points: int = 2_000_000,
+) -> tuple[np.ndarray, bool]:
+    """Build a bandwidth-aware log-m/z grid and report whether it hit the cap."""
+    pad = 5.0 * bw
+    lo = float(np.min(log_mz)) - pad
+    hi = float(np.max(log_mz)) + pad
+    if hi <= lo:
+        hi = lo + max(bw, 1e-6)
+    target_step = max(bw / points_per_bandwidth, np.finfo(np.float64).eps)
+    required = int(np.ceil((hi - lo) / target_step)) + 1
+    requested = max(int(minimum_points), required, 3)
+    n_points = min(requested, int(max_points))
+    return np.linspace(lo, hi, num=n_points), requested > n_points
+
+
+def _nearest_window_assignments(
+    peak_mz: np.ndarray,
+    candidate_mz: np.ndarray,
+    tolerance_ppm: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map each peak to its nearest eligible candidate, never to two channels."""
+    peaks = np.asarray(peak_mz, dtype=np.float64)
+    candidates = np.asarray(candidate_mz, dtype=np.float64)
+    tolerances = np.asarray(tolerance_ppm, dtype=np.float64)
+    if candidates.size == 0 or peaks.size == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    order = np.argsort(candidates)
+    sorted_mz = candidates[order]
+    sorted_tol = tolerances[order]
+    right = np.searchsorted(sorted_mz, peaks)
+    left = right - 1
+
+    def _distance(which: np.ndarray) -> np.ndarray:
+        clipped = np.clip(which, 0, sorted_mz.size - 1)
+        center = sorted_mz[clipped]
+        tol = sorted_tol[clipped]
+        eligible = (which >= 0) & (which < sorted_mz.size)
+        eligible &= np.abs(peaks - center) <= center * tol * 1e-6
+        distance = np.abs(np.log(peaks) - np.log(center))
+        return np.where(eligible, distance, np.inf)
+
+    left_distance = _distance(left)
+    right_distance = _distance(right)
+    choose_right = right_distance < left_distance
+    chosen = np.where(choose_right, right, left)
+    valid = np.isfinite(np.minimum(left_distance, right_distance))
+    peak_idx = np.flatnonzero(valid).astype(np.int64, copy=False)
+    return peak_idx, order[chosen[valid]].astype(np.int64, copy=False)
+
+
+def _downsample_for_diagnostics(values: np.ndarray, max_points: int = 50_000) -> np.ndarray:
+    """Bound GUI/spec diagnostic payload size without changing peak detection."""
+    stride = max(1, int(np.ceil(values.size / max_points)))
+    return values[::stride]
 
 
 def _local_maxima(y: np.ndarray, *, threshold: float) -> np.ndarray:

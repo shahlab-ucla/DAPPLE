@@ -30,19 +30,27 @@ correction via ComBat) belong in operator modules of their own.
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 
-from dapple.data.dataset import MSIDataset, PeakList, PeakMatrix
+from dapple.data.dataset import (
+    CHANNEL_ALIGNED_EXTRA_KEYS,
+    MSIDataset,
+    OpRecord,
+    PeakList,
+    PeakMatrix,
+)
+from dapple.data.hashing import combine_hashes, hash_obj
 from dapple.io.cdf_image_reader import read_cdf_image
 from dapple.io.imzml_reader import read_imzml
 from dapple.ops.consensus import KdeConsensusParams
 from dapple.ops.normalize import MedianNormalize
-from dapple.ops.peak_pick import SnrPeakPick
+from dapple.ops.peak_pick import CwtPeakPick, SnrPeakPick
 from dapple.ops.recalibrate import MsiwarpRecalibrate
 from dapple.ops.reference_ions import DetectReferenceIons
 from dapple.ops.tolerance import (
@@ -72,7 +80,25 @@ class CohortAlignParams:
     default_tol_ppm: float = 50.0
     pool_normalize: bool = True
     recalibrate: bool = True
+    pool_weighting: Literal["sample", "intensity"] = "sample"
+    prevalence_basis: Literal["pixel", "dataset"] = "pixel"
     rng_seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.bandwidth_ppm <= 0 or self.bandwidth_scale <= 0:
+            raise ValueError("bandwidth_ppm and bandwidth_scale must be positive")
+        if self.n_grid_points < 3:
+            raise ValueError("n_grid_points must be at least 3")
+        if not 0.0 <= self.min_prominence_quantile <= 1.0:
+            raise ValueError("min_prominence_quantile must be in [0, 1]")
+        if not 0.0 <= self.min_prevalence <= 1.0:
+            raise ValueError("min_prevalence must be in [0, 1]")
+        if self.default_tol_ppm <= 0:
+            raise ValueError("default_tol_ppm must be positive")
+        if self.pool_weighting not in {"sample", "intensity"}:
+            raise ValueError("pool_weighting must be 'sample' or 'intensity'")
+        if self.prevalence_basis not in {"pixel", "dataset"}:
+            raise ValueError("prevalence_basis must be 'pixel' or 'dataset'")
 
 
 @dataclass
@@ -85,10 +111,10 @@ class CohortAlignResult:
     pixels carrying each consensus peak) is stored in
     ``per_dataset_prevalence`` keyed by dataset index.
 
-    ``cohort_prevalence`` is the *cross-dataset* prevalence — the fraction of
-    cohort-wide pixels (summed across all datasets) carrying each consensus
-    peak. It's how the pooled-KDE consensus filter selected the surviving
-    channels.
+    ``cohort_prevalence`` is the pixel-level cohort prevalence — the fraction
+    of cohort-wide pixels carrying each consensus peak. ``dataset_prevalence``
+    is the fraction of datasets carrying it. The configured
+    ``prevalence_basis`` determines which measure filters candidates.
 
     ``diagnostics`` is a flat dict of summary scalars suitable for logging /
     saving to a manifest.
@@ -97,6 +123,7 @@ class CohortAlignResult:
     aligned_datasets: list[MSIDataset]
     shared_consensus_mz: np.ndarray
     cohort_prevalence: np.ndarray
+    dataset_prevalence: np.ndarray
     per_dataset_prevalence: dict[int, np.ndarray]
     diagnostics: dict[str, float]
 
@@ -108,8 +135,9 @@ def align_cohort(
     """Compute a shared consensus axis across `datasets` and return per-dataset
     PeakMatrix-backed datasets aligned to it.
 
-    Each input dataset must have a ``PeakList`` backend (raw or post-pick — the
-    function doesn't re-pick if peaks are already centroided). Reference-ion
+    Each input dataset must have a ``PeakList`` backend. A prior DAPPLE peak-pick
+    record is respected; otherwise profile inputs use CWT and centroided inputs
+    use the SNR filter. Reference-ion
     detection and tolerance fitting are run *per dataset* so each gets its own
     drift estimate; if ``params.recalibrate`` is True, msiwarp is also run per
     dataset before pooling.
@@ -117,8 +145,6 @@ def align_cohort(
     if not datasets:
         raise ValueError("align_cohort: empty dataset list")
     params = params or CohortAlignParams()
-
-    rng = np.random.default_rng(int(params.rng_seed))
 
     # --- step 1: per-dataset preprocessing --------------------------------------
     prepped: list[MSIDataset] = []
@@ -130,41 +156,98 @@ def align_cohort(
             )
         logger.info("cohort step 1/3: dataset %d/%d preprocessing", di + 1, len(datasets))
         d = ds
+        history_ops = {record.op_name for record in d.history}
+        already_peak_picked = bool(
+            history_ops & {"cwt_peak_pick", "snr_peak_pick"}
+        )
+        if d.metadata.profile_or_centroided == "profile" and not already_peak_picked:
+            # Dense profile points are not valid reference-ion candidates. Pick
+            # centroids first or adjacent prevalent bins collapse into one feature.
+            d = CwtPeakPick().apply(
+                d,
+                CwtPeakPick().default_params(d.metadata),
+                rng=_dataset_rng(params.rng_seed, d, "cwt_peak_pick"),
+            ).dataset
         d = DetectReferenceIons().apply(
-            d, DetectReferenceIons().default_params(d.metadata), rng=rng
+            d,
+            DetectReferenceIons().default_params(d.metadata),
+            rng=_dataset_rng(params.rng_seed, d, "detect_reference_ions"),
         ).dataset
         d = EmpiricalToleranceFromReferenceIons().apply(
             d,
             EmpiricalToleranceParams(alpha=0.01, bootstrap_B=200, block_bootstrap=False),
-            rng=rng,
+            rng=_dataset_rng(params.rng_seed, d, "empirical_tolerance"),
         ).dataset
         if params.recalibrate and d.metadata.instrument_family in {
             "tof_axial", "tof_reflectron", "qtof"
         }:
             d = MsiwarpRecalibrate().apply(
-                d, MsiwarpRecalibrate().default_params(d.metadata), rng=rng
+                d,
+                MsiwarpRecalibrate().default_params(d.metadata),
+                rng=_dataset_rng(params.rng_seed, d, "msiwarp_recalibrate"),
             ).dataset
         if params.pool_normalize:
             d = MedianNormalize().apply(
-                d, MedianNormalize().default_params(d.metadata), rng=rng
+                d,
+                MedianNormalize().default_params(d.metadata),
+                rng=_dataset_rng(params.rng_seed, d, "median_normalize"),
             ).dataset
-        # Run SNR peak pick only if the data is centroided (the same default as
-        # the single-dataset pipeline). For profile data the user should
-        # pre-process with cwt_peak_pick before calling align_cohort.
-        if d.metadata.profile_or_centroided != "profile":
+        if d.metadata.profile_or_centroided != "profile" and not already_peak_picked:
             d = SnrPeakPick().apply(
-                d, SnrPeakPick().default_params(d.metadata), rng=rng
+                d,
+                SnrPeakPick().default_params(d.metadata),
+                rng=_dataset_rng(params.rng_seed, d, "snr_peak_pick"),
             ).dataset
         prepped.append(d)
 
     # --- step 2: pool peaks + run a single KDE consensus -----------------------
     logger.info("cohort step 2/3: pooling peaks and running shared KDE consensus")
-    pooled_mz, pooled_int, pooled_dataset_idx, pooled_pixel_idx = _pool_peaks(prepped)
+    pooled_mz, pooled_int, pooled_dataset_idx = _pool_peaks(prepped)
     if pooled_mz.size == 0:
         raise RuntimeError("align_cohort: no peaks survived per-dataset preprocessing.")
-    shared_axis, candidate_axis = _shared_kde_consensus(
-        pooled_mz, pooled_int, params=params
+    pooled_weights = _cohort_kde_weights(
+        pooled_int,
+        pooled_dataset_idx,
+        n_datasets=len(prepped),
+        mode=params.pool_weighting,
     )
+    candidate_axis, all_local_maxima_axis = _shared_kde_consensus(
+        pooled_mz, pooled_weights, params=params
+    )
+
+    # First assignment pass accumulates only carrier counts. Keeping every full
+    # candidate matrix until filtering roughly doubled peak memory on large
+    # cohorts; reassigning the smaller surviving axis below is deliberately
+    # compute-for-memory and bounds this stage to one dataset matrix at a time.
+    cohort_total_pixels = sum(d.n_pixels for d in prepped)
+    candidate_carriers = np.zeros(candidate_axis.size, dtype=np.int64)
+    candidate_dataset_carriers = np.zeros(candidate_axis.size, dtype=np.int64)
+    for d in prepped:
+        candidate_matrix = _assign_peaks_to_axis(
+            d,
+            candidate_axis,
+            default_tol_ppm=params.default_tol_ppm,
+        )
+        occupied = candidate_matrix > 0
+        candidate_carriers += occupied.sum(axis=0).astype(np.int64)
+        candidate_dataset_carriers += occupied.any(axis=0).astype(np.int64)
+    candidate_pixel_prev = candidate_carriers.astype(np.float64) / max(
+        cohort_total_pixels, 1
+    )
+    candidate_dataset_prev = candidate_dataset_carriers.astype(np.float64) / len(prepped)
+    filter_prev = (
+        candidate_pixel_prev
+        if params.prevalence_basis == "pixel"
+        else candidate_dataset_prev
+    )
+    prevalence_keep = filter_prev >= params.min_prevalence
+    if not prevalence_keep.any():
+        raise RuntimeError(
+            "align_cohort: no shared channels survived "
+            f"{params.prevalence_basis} prevalence >= {params.min_prevalence}; "
+            f"maximum was {float(filter_prev.max()):.4f}."
+        )
+    shared_axis = candidate_axis[prevalence_keep]
 
     # --- step 3: build per-dataset matrices on the shared axis -----------------
     logger.info(
@@ -173,22 +256,45 @@ def align_cohort(
     )
     aligned: list[MSIDataset] = []
     per_dataset_prev: dict[int, np.ndarray] = {}
-    cohort_total_pixels = sum(d.n_pixels for d in prepped)
     cohort_carriers = np.zeros(shared_axis.size, dtype=np.int64)
+    dataset_carriers = np.zeros(shared_axis.size, dtype=np.int64)
+    cohort_record = _cohort_history_record(
+        params=params,
+        inputs=prepped,
+        shared_axis=shared_axis,
+    )
     for di, d in enumerate(prepped):
         matrix = _assign_peaks_to_axis(
-            d, shared_axis, default_tol_ppm=params.default_tol_ppm
+            d,
+            shared_axis,
+            default_tol_ppm=params.default_tol_ppm,
         )
-        prev = (matrix > 0).sum(axis=0) / max(d.n_pixels, 1)
+        occupied = matrix > 0
+        prev = occupied.sum(axis=0) / max(d.n_pixels, 1)
         per_dataset_prev[di] = prev.astype(np.float64, copy=False)
-        cohort_carriers += (matrix > 0).sum(axis=0).astype(np.int64)
+        cohort_carriers += occupied.sum(axis=0).astype(np.int64)
+        dataset_carriers += occupied.any(axis=0).astype(np.int64)
         new_pm = PeakMatrix(
             matrix=matrix.astype(np.float32, copy=False),
             mz_axis=shared_axis.astype(np.float64, copy=False),
         )
-        new_extra = {**d.extra, "consensus_prevalence": prev.astype(np.float64, copy=False)}
-        new_extra["cohort_dataset_index"] = di
-        new_extra["cohort_size"] = len(prepped)
+        # The shared cohort axis is unrelated to each input dataset's former
+        # channel axis.  Drop every old channel-aligned companion array before
+        # attaching statistics computed for the shared axis.
+        new_extra = {
+            key: value
+            for key, value in d.extra.items()
+            if key not in CHANNEL_ALIGNED_EXTRA_KEYS
+        }
+        new_extra.update(
+            {
+                "consensus_prevalence": prev.astype(np.float64, copy=False),
+                "cohort_prevalence": candidate_pixel_prev[prevalence_keep],
+                "cohort_dataset_prevalence": candidate_dataset_prev[prevalence_keep],
+                "cohort_dataset_index": di,
+                "cohort_size": len(prepped),
+            }
+        )
         new_ds = d.__class__(
             coords=d.coords,
             grid_shape=d.grid_shape,
@@ -200,24 +306,34 @@ def align_cohort(
             rng_seed=d.rng_seed,
             extra=new_extra,
         )
+        new_ds = new_ds.with_history(cohort_record)
         aligned.append(new_ds)
 
     cohort_prev = cohort_carriers.astype(np.float64) / max(cohort_total_pixels, 1)
+    dataset_prev = dataset_carriers.astype(np.float64) / max(len(prepped), 1)
 
     diagnostics = {
         "n_datasets": float(len(datasets)),
         "n_total_pixels": float(cohort_total_pixels),
         "n_total_peaks_pooled": float(int(pooled_mz.size)),
+        "n_local_maxima_total": float(int(all_local_maxima_axis.size)),
         "n_consensus_candidates_pre_filter": float(int(candidate_axis.size)),
+        "n_rejected_by_prevalence": float(int((~prevalence_keep).sum())),
         "n_consensus_shared": float(int(shared_axis.size)),
         "cohort_prevalence_min": float(cohort_prev.min()),
         "cohort_prevalence_median": float(np.median(cohort_prev)),
         "cohort_prevalence_max": float(cohort_prev.max()),
+        "dataset_prevalence_min": float(dataset_prev.min()),
+        "dataset_prevalence_median": float(np.median(dataset_prev)),
+        "dataset_prevalence_max": float(dataset_prev.max()),
+        "min_prevalence_threshold": float(params.min_prevalence),
+        "prevalence_basis_dataset": float(params.prevalence_basis == "dataset"),
     }
     return CohortAlignResult(
         aligned_datasets=aligned,
         shared_consensus_mz=shared_axis,
         cohort_prevalence=cohort_prev,
+        dataset_prevalence=dataset_prev,
         per_dataset_prevalence=per_dataset_prev,
         diagnostics=diagnostics,
     )
@@ -225,32 +341,20 @@ def align_cohort(
 
 def _pool_peaks(
     datasets: Sequence[MSIDataset],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Concatenate every (m/z, intensity, dataset_idx, pixel_idx) tuple into flat arrays.
-
-    pixel_idx is the within-dataset pixel index. dataset_idx is its index in
-    the input list.
-    """
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Concatenate ``(m/z, intensity, dataset_idx)`` arrays for pooled KDE."""
     mz_parts: list[np.ndarray] = []
     int_parts: list[np.ndarray] = []
     di_parts: list[np.ndarray] = []
-    px_parts: list[np.ndarray] = []
     for di, d in enumerate(datasets):
         pl: PeakList = d.backend  # type: ignore[assignment]
         mz_parts.append(np.asarray(pl.mz[:], dtype=np.float64))
         int_parts.append(np.asarray(pl.intensity[:], dtype=np.float32))
-        offsets = np.asarray(pl.offsets[:])
-        per_peak_pixel = np.repeat(
-            np.arange(pl.n_pixels, dtype=np.int64),
-            np.diff(offsets).astype(np.int64),
-        )
-        px_parts.append(per_peak_pixel)
-        di_parts.append(np.full(per_peak_pixel.size, di, dtype=np.int64))
+        di_parts.append(np.full(len(pl.mz), di, dtype=np.int64))
     return (
         np.concatenate(mz_parts),
         np.concatenate(int_parts),
         np.concatenate(di_parts),
-        np.concatenate(px_parts),
     )
 
 
@@ -267,24 +371,29 @@ def _shared_kde_consensus(
     the candidate-axis selection is identical so cohort and single-dataset
     behaviour line up exactly when ``len(datasets) == 1``.
     """
-    from dapple.ops.consensus import _kde_eval_1d, _local_maxima
+    from dapple.ops.consensus import _adaptive_kde_grid, _kde_eval_1d, _local_maxima
 
     log_mz = np.log(pooled_mz)
     weights = pooled_int.astype(np.float64)
     bw = max(params.bandwidth_ppm * params.bandwidth_scale * 1e-6, 1e-12)
 
-    pad = 5.0 * bw
-    log_lo = float(log_mz.min()) - pad
-    log_hi = float(log_mz.max()) + pad
-    if log_hi <= log_lo:
-        log_hi = log_lo + 1e-6
-    grid_log = np.linspace(log_lo, log_hi, num=int(params.n_grid_points))
+    grid_log, _grid_was_capped = _adaptive_kde_grid(
+        log_mz,
+        bw,
+        minimum_points=int(params.n_grid_points),
+    )
     density = _kde_eval_1d(log_mz, weights, grid_log, bw)
 
     all_max_idx = _local_maxima(density, threshold=-np.inf)
     if all_max_idx.size == 0:
         all_max_idx = np.array([int(density.argmax())])
-    prominence_thr = float(np.quantile(density, params.min_prominence_quantile))
+    positive_density = density[density > 0]
+    prominence_thr = float(
+        np.quantile(
+            positive_density if positive_density.size else density,
+            params.min_prominence_quantile,
+        )
+    )
     keep = density[all_max_idx] > prominence_thr
     candidate_idx = all_max_idx[keep] if all_max_idx.size else all_max_idx
     if candidate_idx.size == 0:
@@ -324,31 +433,79 @@ def _assign_peaks_to_axis(
         axis_tol_ppm = tol_curve.evaluate(shared_axis)
     else:
         axis_tol_ppm = np.full(n_axis, default_tol_ppm)
-    lo = shared_axis * (1 - axis_tol_ppm * 1e-6)
-    hi = shared_axis * (1 + axis_tol_ppm * 1e-6)
+    from dapple.ops.consensus import _nearest_window_assignments
 
-    sorted_axis = np.argsort(shared_axis)
-    sorted_mz = shared_axis[sorted_axis]
-    idx_right = np.searchsorted(sorted_mz, peak_mz)
-    idx_left = idx_right - 1
-    for which in (idx_left, idx_right):
-        valid = (which >= 0) & (which < n_axis)
-        if not valid.any():
-            continue
-        sel = which[valid]
-        in_window = (peak_mz[valid] >= lo[sorted_axis[sel]]) & (
-            peak_mz[valid] <= hi[sorted_axis[sel]]
-        )
-        if not in_window.any():
-            continue
-        sel = sel[in_window]
-        sel_orig_axis = sorted_axis[sel]
-        np.maximum.at(
-            matrix,
-            (peak_pixel[valid][in_window], sel_orig_axis),
-            peak_int[valid][in_window],
-        )
+    peak_idx, axis_idx = _nearest_window_assignments(
+        peak_mz,
+        shared_axis,
+        np.asarray(axis_tol_ppm, dtype=np.float64),
+    )
+    np.maximum.at(
+        matrix,
+        (peak_pixel[peak_idx], axis_idx),
+        peak_int[peak_idx],
+    )
     return matrix
+
+
+def _dataset_rng(seed: int, ds: MSIDataset, stage: str) -> np.random.Generator:
+    """Derive order-independent per-dataset/per-stage randomness."""
+    token = hash_obj(
+        {
+            "seed": int(seed),
+            "dataset": ds.identity.content_sha256,
+            "stage": stage,
+        }
+    )
+    return np.random.default_rng(int(token[:16], 16) & 0xFFFFFFFF)
+
+
+def _cohort_kde_weights(
+    intensities: np.ndarray,
+    dataset_index: np.ndarray,
+    *,
+    n_datasets: int,
+    mode: Literal["sample", "intensity"],
+) -> np.ndarray:
+    """Return raw weights or equal-total-weight sample contributions."""
+    weights = np.maximum(np.asarray(intensities, dtype=np.float64), 0.0)
+    if mode == "intensity":
+        return weights
+    balanced = np.zeros_like(weights)
+    for di in range(n_datasets):
+        mask = dataset_index == di
+        total = float(weights[mask].sum())
+        if total > 0:
+            balanced[mask] = weights[mask] / total
+        elif mask.any():
+            balanced[mask] = 1.0 / int(mask.sum())
+    return balanced
+
+
+def _cohort_history_record(
+    *,
+    params: CohortAlignParams,
+    inputs: Sequence[MSIDataset],
+    shared_axis: np.ndarray,
+) -> OpRecord:
+    """Fingerprint cohort composition, parameters, and resulting shared axis."""
+    input_hash = combine_hashes(*(ds.hash(include_rois=False) for ds in inputs))
+    axis_hash = hashlib.sha256(
+        np.asarray(shared_axis, dtype="<f8").tobytes(order="C")
+    ).hexdigest()
+    output_hash = combine_hashes(
+        "cohort_alignment",
+        input_hash,
+        hash_obj(params),
+        axis_hash,
+    )
+    return OpRecord(
+        op_name="cohort_alignment",
+        params_hash=hash_obj(params),
+        input_hash=input_hash,
+        output_hash=output_hash,
+        diagnostics_summary=(),
+    )
 
 
 # ---- directory loader ---------------------------------------------------------

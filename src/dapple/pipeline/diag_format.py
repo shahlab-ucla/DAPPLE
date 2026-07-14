@@ -412,21 +412,30 @@ RUBRICS: dict[str, Rubric] = {
     "q_threshold": Rubric(label="q_threshold", fmt="{:.3f}"),
 
     # prevalence_fdr_filter
-    "p_value_min": Rubric(label="p-value min", fmt="{:.4f}"),
-    "p_value_median": Rubric(label="p-value median", fmt="{:.4f}"),
-    "q_value_min": Rubric(label="q-value min", fmt="{:.4f}"),
-    "q_value_median": Rubric(label="q-value median", fmt="{:.4f}"),
+    "p_value_min": Rubric(label="occupancy p-score min", fmt="{:.4f}"),
+    "p_value_median": Rubric(label="occupancy p-score median", fmt="{:.4f}"),
+    "q_value_min": Rubric(label="adjusted sensitivity score min", fmt="{:.4f}"),
+    "q_value_median": Rubric(label="adjusted sensitivity score median", fmt="{:.4f}"),
+    "warning_uncalibrated_occupancy_null": Rubric(
+        label="!! experimental occupancy model",
+        fmt="{:.0f}",
+        bad=lambda v: v >= 1.0,
+        meaning="always set to 1 because consensus selection and per-pixel "
+                "assignment violate the with-replacement occupancy null.",
+        bad_advice="treat the reported values as sensitivity scores only. "
+                   "Prefer a declared min_prevalence threshold or cohort "
+                   "dataset prevalence for production decisions.",
+    ),
     "warning_conservative_fallback": Rubric(
         label="!! conservative fallback",
         fmt="{:.0f}",
         bad=lambda v: v >= 1.0,
         meaning="set to 1 when the upstream consensus operator did not record "
-                "per-channel peak counts. The FDR test falls back to using the "
-                "observed non-zero count as the ball count, which produces a "
-                "conservative (under-rejective) test.",
+                "per-channel peak counts. The sensitivity calculation falls "
+                "back to the observed carrier count.",
         bad_advice="re-run the upstream consensus operator so it records "
-                   "consensus_n_peaks_per_channel. The test is still valid but "
-                   "leaves more borderline channels in than it would otherwise.",
+                   "consensus_n_peaks_per_channel. Even with that count, the "
+                   "occupancy model remains experimental and uncalibrated.",
     ),
 
     # hot_pixel_filter
@@ -482,7 +491,7 @@ OP_HEADERS: dict[str, str] = {
     "kde_consensus_alignment": "Consensus alignment (KDE)",
     "dbscan_consensus": "Consensus alignment (DBSCAN)",
     "morans_i_permutation": "Spatial filter (Moran's I)",
-    "prevalence_fdr_filter": "Prevalence FDR filter",
+    "prevalence_fdr_filter": "Experimental prevalence sensitivity filter",
     "hot_pixel_filter": "Hot-pixel filter",
     "background_subtract": "Background subtraction",
 }

@@ -248,6 +248,29 @@ class CwtPeakPickParams(OpParams):
             ),
         },
     )
+    max_grid_points: int = field(
+        default=1_000_000,
+        metadata={
+            "label": "Maximum resampling grid points",
+            "help": (
+                "Safety cap for the per-pixel log-m/z grid. Very broad Orbitrap "
+                "ranges at a 0.5 ppm step otherwise create several million samples "
+                "per pixel. When capped, DAPPLE reports the effective coarser step."
+            ),
+        },
+    )
+    max_native_oversampling: float = field(
+        default=8.0,
+        metadata={
+            "label": "Maximum native-grid oversampling",
+            "help": (
+                "Do not interpolate a profile spectrum more finely than this "
+                "multiple of its observed m/z sampling density. Interpolation "
+                "cannot add mass resolution; the default 8× preserves smooth "
+                "wavelet localization while avoiding needlessly huge grids."
+            ),
+        },
+    )
     min_snr: float = field(
         default=3.0,
         metadata={
@@ -271,6 +294,22 @@ class CwtPeakPickParams(OpParams):
             ),
         },
     )
+
+    def __post_init__(self) -> None:
+        if self.width_min_ppm <= 0 or self.width_max_ppm < self.width_min_ppm:
+            raise ValueError("CWT widths must be positive and max >= min")
+        if self.n_widths < 1:
+            raise ValueError("n_widths must be at least 1")
+        if self.grid_ppm_step <= 0:
+            raise ValueError("grid_ppm_step must be positive")
+        if self.max_grid_points < 3:
+            raise ValueError("max_grid_points must be at least 3")
+        if self.max_native_oversampling < 1:
+            raise ValueError("max_native_oversampling must be at least 1")
+        if self.min_snr <= 0:
+            raise ValueError("min_snr must be positive")
+        if not 0 <= self.noise_perc <= 100:
+            raise ValueError("noise_perc must be in [0, 100]")
 
 
 @register
@@ -334,21 +373,112 @@ class CwtPeakPick(Operator):
             raise RuntimeError(
                 f"cwt_peak_pick: nonsensical m/z bounds ({mz_min}, {mz_max})."
             )
-        log_step = float(np.log1p(params.grid_ppm_step * 1e-6))
-        log_grid = np.arange(np.log(mz_min), np.log(mz_max) + log_step, log_step)
-        mz_grid = np.exp(log_grid)
+        requested_log_step = float(np.log1p(params.grid_ppm_step * 1e-6))
+        log_span = float(np.log(mz_max) - np.log(mz_min))
+        requested_points = int(np.ceil(log_span / requested_log_step)) + 1
+
+        # Most profile-mode formats store every pixel on one calibrated native
+        # grid. Running directly on that grid is both faster and more faithful:
+        # interpolation cannot create resolution and may manufacture thousands of
+        # highly correlated samples. Accept common linear- or log-spaced grids.
+        first_a, first_b = int(offsets_in[0]), int(offsets_in[1])
+        first_grid = mz_in[first_a:first_b]
+        shared_native_grid = first_grid.size >= 3 and first_grid.size <= params.max_grid_points
+        if shared_native_grid:
+            for pixel in range(1, n_pixels):
+                a, b = int(offsets_in[pixel]), int(offsets_in[pixel + 1])
+                segment = mz_in[a:b]
+                if segment.shape != first_grid.shape or not np.allclose(
+                    segment, first_grid, rtol=1e-10, atol=1e-12
+                ):
+                    shared_native_grid = False
+                    break
+        linear_deltas = np.diff(first_grid) if first_grid.size >= 2 else np.empty(0)
+        log_deltas = (
+            np.diff(np.log(first_grid))
+            if first_grid.size >= 2 and np.all(first_grid > 0)
+            else np.empty(0)
+        )
+
+        def _is_regular(deltas: np.ndarray) -> bool:
+            if deltas.size == 0 or np.any(deltas <= 0):
+                return False
+            center = float(np.median(deltas))
+            return bool(np.max(np.abs(deltas - center)) <= max(abs(center) * 1e-5, 1e-15))
+
+        native_spacing = (
+            "linear"
+            if shared_native_grid and _is_regular(linear_deltas)
+            else "log"
+            if shared_native_grid and _is_regular(log_deltas)
+            else None
+        )
+        use_native_grid = native_spacing is not None
+
+        # Interpolating far below the native profile spacing adds no information
+        # and made broad-range datasets spend most of their time on synthetic
+        # samples. Estimate a robust within-spectrum spacing from a small,
+        # deterministic pixel sample and cap oversampling accordingly.
+        native_steps: list[float] = []
+        sample_pixels = np.linspace(
+            0, max(n_pixels - 1, 0), num=min(n_pixels, 32), dtype=np.int64
+        )
+        for pixel in np.unique(sample_pixels):
+            a, b = int(offsets_in[pixel]), int(offsets_in[pixel + 1])
+            segment = mz_in[a:b]
+            valid = segment[np.isfinite(segment) & (segment > 0)]
+            if valid.size < 2:
+                continue
+            deltas = np.diff(np.log(valid))
+            deltas = deltas[deltas > 0]
+            if deltas.size:
+                native_steps.append(float(np.median(deltas)))
+        native_log_step = float(np.median(native_steps)) if native_steps else 0.0
+        resolution_limited_step = (
+            native_log_step / float(params.max_native_oversampling)
+            if native_log_step > 0
+            else requested_log_step
+        )
+        effective_requested_step = max(requested_log_step, resolution_limited_step)
+        effective_requested_points = int(np.ceil(log_span / effective_requested_step)) + 1
+        grid_capped = effective_requested_points > int(params.max_grid_points)
+        if use_native_grid:
+            mz_grid = first_grid
+            log_step = native_log_step
+            grid_capped = False
+        elif grid_capped:
+            log_grid = np.linspace(
+                np.log(mz_min),
+                np.log(mz_max),
+                num=int(params.max_grid_points),
+            )
+            log_step = float(log_grid[1] - log_grid[0])
+        else:
+            log_step = effective_requested_step
+            log_grid = np.arange(np.log(mz_min), np.log(mz_max) + log_step, log_step)
+        if not use_native_grid:
+            mz_grid = np.exp(log_grid)
         # Convert ppm widths to grid samples.
         log_min_w = np.log1p(params.width_min_ppm * 1e-6)
         log_max_w = np.log1p(params.width_max_ppm * 1e-6)
-        widths = np.linspace(
-            log_min_w / log_step, log_max_w / log_step, num=int(params.n_widths)
-        )
+        if native_spacing == "linear":
+            linear_step = float(np.median(linear_deltas))
+            width_min_samples = params.width_min_ppm * 1e-6 * mz_min / linear_step
+            width_max_samples = params.width_max_ppm * 1e-6 * mz_max / linear_step
+            widths = np.linspace(
+                width_min_samples, width_max_samples, num=int(params.n_widths)
+            )
+        else:
+            widths = np.linspace(
+                log_min_w / log_step, log_max_w / log_step, num=int(params.n_widths)
+            )
         widths = np.clip(widths, 1.0, None)
 
         kept_per_pixel: list[int] = []
         out_mz: list[np.ndarray] = []
         out_int: list[np.ndarray] = []
         new_offsets = [0]
+        n_failed_pixels = 0
 
         for i in range(n_pixels):
             a, b = int(offsets_in[i]), int(offsets_in[i + 1])
@@ -356,10 +486,13 @@ class CwtPeakPick(Operator):
                 kept_per_pixel.append(0)
                 new_offsets.append(new_offsets[-1])
                 continue
-            # Resample this pixel onto the regular log grid via interpolation.
             seg_mz = mz_in[a:b]
             seg_int = int_in[a:b]
-            resampled = np.interp(mz_grid, seg_mz, seg_int, left=0.0, right=0.0)
+            resampled = (
+                seg_int
+                if use_native_grid
+                else np.interp(mz_grid, seg_mz, seg_int, left=0.0, right=0.0)
+            )
 
             try:
                 peak_idx = find_peaks_cwt(
@@ -368,7 +501,8 @@ class CwtPeakPick(Operator):
                     min_snr=float(params.min_snr),
                     noise_perc=float(params.noise_perc),
                 )
-            except Exception:  # noqa: BLE001 — scipy can raise on degenerate inputs
+            except (ValueError, FloatingPointError):
+                n_failed_pixels += 1
                 peak_idx = np.empty(0, dtype=np.int64)
 
             peak_idx = np.asarray(peak_idx, dtype=np.int64)
@@ -423,6 +557,15 @@ class CwtPeakPick(Operator):
                 "kept_per_pixel_median": float(np.median(kept)),
                 "kept_per_pixel_max": float(int(kept.max())),
                 "grid_size": float(mz_grid.size),
+                "grid_requested_size": float(requested_points),
+                "grid_capped": float(grid_capped),
+                "grid_limited_by_native_resolution": float(
+                    effective_requested_step > requested_log_step * (1.0 + 1e-12)
+                ),
+                "native_grid_used": float(use_native_grid),
+                "native_grid_ppm_step": float(np.expm1(native_log_step) * 1e6),
+                "effective_grid_ppm_step": float(np.expm1(log_step) * 1e6),
+                "n_failed_pixels": float(n_failed_pixels),
                 "n_widths": float(widths.size),
                 "min_snr": float(params.min_snr),
             },

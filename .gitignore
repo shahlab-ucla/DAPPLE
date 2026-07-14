@@ -68,8 +68,8 @@ Thumbs.db
 *.zarr/
 
 # --- Local datasets (do NOT commit raw MSI data) ---
-datasets/
-data/
+/datasets/
+/data/
 *.imzML
 *.imzml
 *.ibd

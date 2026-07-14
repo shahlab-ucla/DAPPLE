@@ -6,8 +6,8 @@ non-foreground pixels as the implicit reference). The widget shows the current R
 list, lets the user rename or delete entries, and toggle the background flag.
 
 The shape ↔ RoiDef mapping uses the shape's index in the layer plus a sidecar list
-on the widget. Pixel coordinates are stored 1-indexed (imzML convention) so they
-travel cleanly through `MSIDataset.coords`.
+on the widget. Polygon vertices use napari's zero-based ``(y, x)`` data coordinates;
+dataset spectrum coordinates are converted separately when masks are sampled.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from qtpy.QtWidgets import (
 )
 
 from dapple.data.metadata import RoiDef
-from dapple.widgets._session import MsiSession, default_session
+from dapple.widgets._session import MsiSession, adopt_dataset_from_viewer, default_session
 
 if TYPE_CHECKING:
     import napari
@@ -99,6 +99,7 @@ class RoiWidget(QWidget):
         super().__init__(parent)
         self._viewer = napari_viewer
         self._session = session or default_session()
+        adopt_dataset_from_viewer(self._session, napari_viewer)
         self._roi_names: list[str] = []
         self._is_background: list[bool] = []
         self._suppress_layer_event = False
@@ -120,6 +121,10 @@ class RoiWidget(QWidget):
 
         self._bg_outside = QCheckBox("Treat outside-ROI pixels as background")
         self._bg_outside.setChecked(False)
+        self._bg_outside.setToolTip(
+            "Sets the default on the optional background-subtraction card. Explicit "
+            "background polygons take priority."
+        )
         layout.addWidget(self._bg_outside)
 
         self._table = QTableWidget(0, 3, self)

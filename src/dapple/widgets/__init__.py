@@ -1,7 +1,8 @@
 """Napari widgets: wizard, channels panel, spectrum panel, preview, ROI."""
 
-from dapple.widgets._session import MsiSession, default_session
+from dapple.widgets._session import MsiSession, adopt_dataset_from_viewer, default_session
 from dapple.widgets.channels import ChannelsPanel
+from dapple.widgets.developmental import DevelopmentalAnalysisWidget
 from dapple.widgets.preview import PreviewWidget
 from dapple.widgets.roi import RoiWidget
 from dapple.widgets.spectrum import SpectrumPanel
@@ -16,6 +17,7 @@ HyperspectralBrowser = ChannelsPanel
 
 __all__ = [
     "ChannelsPanel",
+    "DevelopmentalAnalysisWidget",
     "HyperspectralBrowser",
     "MsiSession",
     "PreviewWidget",
@@ -23,5 +25,6 @@ __all__ = [
     "SpectrumPanel",
     "ThresholdExplorerPanel",
     "WizardWidget",
+    "adopt_dataset_from_viewer",
     "default_session",
 ]

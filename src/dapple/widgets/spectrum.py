@@ -27,7 +27,7 @@ from qtpy.QtWidgets import (
 )
 
 from dapple.data.dataset import PeakList, PeakMatrix
-from dapple.widgets._session import MsiSession, default_session
+from dapple.widgets._session import MsiSession, adopt_dataset_from_viewer, default_session
 
 if TYPE_CHECKING:
     import napari
@@ -46,6 +46,7 @@ class SpectrumPanel(QWidget):
         super().__init__(parent)
         self._viewer = napari_viewer
         self._session = session or default_session()
+        adopt_dataset_from_viewer(self._session, napari_viewer)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -218,6 +219,7 @@ class SpectrumPanel(QWidget):
 
     def _refresh(self) -> None:
         ds = self._session.dataset
+        raw_ds = self._session.raw_dataset
         self._plot.clear()
         # Re-add the click marker since clear() removed it. Keep it hidden until the
         # user clicks — preserves selection across refresh, but only after a click.
@@ -226,24 +228,31 @@ class SpectrumPanel(QWidget):
         self._last_peaks_mz = None
         if ds is None:
             self._info.setText("(no dataset loaded)")
+            self._raw_check.setEnabled(False)
             return
+        self._raw_check.setEnabled(raw_ds is not None)
+        self._raw_check.setToolTip(
+            "Original peak-list spectrum retained before harmonization."
+            if raw_ds is not None
+            else "The original peak-list data are unavailable for this processed file."
+        )
         mode = self._mode_combo.currentText()
         agg = self._agg_combo.currentText()
 
         if mode == "single pixel":
-            self._render_single_pixel(ds)
+            self._render_single_pixel(ds, raw_ds)
         else:
-            self._render_polygon_aggregate(ds, agg)
+            self._render_polygon_aggregate(ds, raw_ds, agg)
 
-    def _render_single_pixel(self, ds) -> None:  # noqa: ANN001
+    def _render_single_pixel(self, ds, raw_ds) -> None:  # noqa: ANN001
         sel = self._session.selected_pixel
         if sel is None:
             self._info.setText("Hover over a pixel to view its spectrum")
             return
         x, y = sel
         self._info.setText(f"single pixel: x={x}, y={y}")
-        if self._raw_check.isChecked():
-            mz, intensity = ds.pixel_spectrum(x, y)
+        if self._raw_check.isChecked() and raw_ds is not None:
+            mz, intensity = raw_ds.pixel_spectrum(x, y)
             if mz.size > 0:
                 self._plot_stem(mz, intensity, name="raw", color="b")
         if self._harm_check.isChecked() and isinstance(ds.backend, PeakMatrix):
@@ -257,7 +266,9 @@ class SpectrumPanel(QWidget):
                 if nz.size:
                     self._plot_stem(mz_axis[nz], row[nz], name="harmonized", color="r")
 
-    def _render_polygon_aggregate(self, ds, method: AggregationMethod) -> None:  # noqa: ANN001
+    def _render_polygon_aggregate(
+        self, ds, raw_ds, method: AggregationMethod  # noqa: ANN001
+    ) -> None:
         # Build a pixel mask from the session's ROIs (foreground only). If the session
         # has no ROIs but a napari Shapes layer is sitting on the canvas with polygons
         # drawn, fall back to those — this keeps polygon-aggregate mode working when
@@ -288,8 +299,9 @@ class SpectrumPanel(QWidget):
             nz = np.flatnonzero(agg > 0)
             if nz.size:
                 self._plot_stem(mz_axis[nz], agg[nz], name="harmonized", color="r")
-        if self._raw_check.isChecked() and isinstance(ds.backend, PeakList):
-            mz_all, int_all = self._raw_aggregate_peaklist(ds, mask, method)
+        if self._raw_check.isChecked() and raw_ds is not None:
+            raw_mask = self._mask_from_rois(raw_ds, foreground)
+            mz_all, int_all = self._raw_aggregate_peaklist(raw_ds, raw_mask, method)
             if mz_all.size:
                 self._plot_stem(mz_all, int_all, name="raw (binned)", color="b")
 
@@ -324,66 +336,92 @@ class SpectrumPanel(QWidget):
     def _raw_aggregate_peaklist(
         self, ds, mask: np.ndarray, method: AggregationMethod  # noqa: ANN001
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Pre-consensus aggregation: pool peaks from masked pixels into ±50 ppm bins
-        and aggregate intensities. This is a coarse view (the harmonized panel is
-        the precise one); we surface it so the user can see what raw peaks look like
-        before alignment.
+        """Aggregate raw peaks on a stable 50 ppm log grid.
+
+        Multiple entries from one pixel/bin are summed first. Cross-pixel mean and
+        median include non-detecting ROI pixels as zeros, matching PeakMatrix
+        semantics instead of over-weighting frequently detected peaks.
         """
         pl: PeakList = ds.backend
         offsets = np.asarray(pl.offsets[:])
         peak_mz = np.asarray(pl.mz[:])
         peak_int = np.asarray(pl.intensity[:])
-        # Per-peak pixel index, then keep only those in mask.
         peak_pixel = np.repeat(
             np.arange(pl.n_pixels, dtype=np.int64), np.diff(offsets).astype(np.int64)
         )
-        keep = mask[peak_pixel]
+        keep = (
+            mask[peak_pixel]
+            & np.isfinite(peak_mz)
+            & (peak_mz > 0)
+            & np.isfinite(peak_int)
+            & (peak_int > 0)
+        )
         sub_mz = peak_mz[keep]
-        sub_int = peak_int[keep]
+        sub_int = peak_int[keep].astype(np.float64, copy=False)
+        sub_pixel = peak_pixel[keep]
         if sub_mz.size == 0:
             return np.empty(0), np.empty(0)
-        # Log-space bin at 50 ppm.
+
         bw = 50e-6
-        log_mz = np.log(sub_mz)
-        bin_idx = np.floor((log_mz - log_mz.min()) / bw).astype(np.int64)
-        # Aggregate per bin.
-        n_bins = int(bin_idx.max()) + 1
+        absolute_bins = np.floor(np.log(sub_mz) / bw).astype(np.int64)
+        unique_bins, compact_bins = np.unique(absolute_bins, return_inverse=True)
+        n_bins = int(unique_bins.size)
+
+        # Reduce duplicate entries from each pixel/bin without allocating a full
+        # ROI-pixel by raw-bin matrix.
+        keys = sub_pixel * n_bins + compact_bins
+        order = np.argsort(keys, kind="stable")
+        sorted_keys = keys[order]
+        starts = np.r_[0, np.flatnonzero(np.diff(sorted_keys)) + 1]
+        pair_keys = sorted_keys[starts]
+        pair_values = np.add.reduceat(sub_int[order], starts)
+        pair_bins = pair_keys % n_bins
+        n_roi_pixels = int(mask.sum())
+
+        sums = np.bincount(pair_bins, weights=pair_values, minlength=n_bins)
         if method == "sum":
-            out = np.bincount(bin_idx, weights=sub_int.astype(np.float64), minlength=n_bins)
+            out = sums
+        elif method == "mean":
+            out = sums / max(n_roi_pixels, 1)
         elif method == "max":
             out = np.zeros(n_bins, dtype=np.float64)
-            np.maximum.at(out, bin_idx, sub_int.astype(np.float64))
-        elif method == "mean":
-            counts = np.bincount(bin_idx, minlength=n_bins).astype(np.float64)
-            sums = np.bincount(bin_idx, weights=sub_int.astype(np.float64), minlength=n_bins)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                out = np.where(counts > 0, sums / counts, 0.0)
-        else:  # median is expensive — approximate with mean for the raw view
-            counts = np.bincount(bin_idx, minlength=n_bins).astype(np.float64)
-            sums = np.bincount(bin_idx, weights=sub_int.astype(np.float64), minlength=n_bins)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                out = np.where(counts > 0, sums / counts, 0.0)
-        # bin centers, dropping empty bins
-        bin_centers_log = log_mz.min() + (np.arange(n_bins) + 0.5) * bw
+            np.maximum.at(out, pair_bins, pair_values)
+        else:
+            out = np.zeros(n_bins, dtype=np.float64)
+            for j in range(n_bins):
+                values = np.sort(pair_values[pair_bins == j])
+                n_zeros = n_roi_pixels - values.size
+
+                def ordered_value(
+                    index: int,
+                    *,
+                    zero_count: int = n_zeros,
+                    sorted_values: np.ndarray = values,
+                ) -> float:
+                    return (
+                        0.0
+                        if index < zero_count
+                        else float(sorted_values[index - zero_count])
+                    )
+
+                middle = n_roi_pixels // 2
+                if n_roi_pixels % 2:
+                    out[j] = ordered_value(middle)
+                else:
+                    out[j] = 0.5 * (
+                        ordered_value(middle - 1) + ordered_value(middle)
+                    )
+
+        bin_centers_log = (unique_bins.astype(np.float64) + 0.5) * bw
         nz = np.flatnonzero(out > 0)
         return np.exp(bin_centers_log[nz]), out[nz].astype(np.float32)
 
     def _mask_from_rois(self, ds, rois) -> np.ndarray:  # noqa: ANN001
-        from skimage.draw import polygon as sk_polygon
+        from dapple.analysis.spatial import rasterize_rois
 
-        h, w = ds.grid_shape
-        grid_mask = np.zeros((h, w), dtype=bool)
-        for r in rois:
-            ys = np.asarray([v[0] for v in r.vertices])
-            xs = np.asarray([v[1] for v in r.vertices])
-            rr, cc = sk_polygon(ys, xs, shape=(h, w))
-            grid_mask[rr, cc] = True
-        # Map grid_mask back onto coords (n_pixels,).
-        coords = ds.coords
-        from dapple.data.coords import coords_to_grid_index
-
-        flat_idx = coords_to_grid_index(coords, ds.grid_shape)
-        return grid_mask.reshape(-1)[flat_idx]
+        selected = tuple(rois)
+        masks = rasterize_rois(ds, selected, overlap_policy="allow")
+        return masks.union(tuple(r.name for r in selected))
 
     def _plot_stem(self, x: np.ndarray, y: np.ndarray, *, name: str, color: str) -> None:
         # Stem plot: vertical line per peak. pyqtgraph doesn't have one natively;

@@ -17,6 +17,7 @@ returned ``MetadataSource`` map tags overridden fields with ``"sidecar"`` or
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
@@ -35,10 +36,13 @@ def load_json_sidecar(
     Unknown keys are ignored with a debug log; numeric fields are coerced; the
     ``sample_type`` field accepts empty string as "unset".
     """
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path}: could not read metadata JSON: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: top-level JSON must be an object, got {type(raw).__name__}")
-    return _apply_overrides(raw, metadata, source, "sidecar")
+    return _apply_overrides(raw, metadata, source, "sidecar", context=str(path))
 
 
 def load_spec_xml_sidecar(
@@ -61,7 +65,7 @@ def load_spec_xml_sidecar(
         if val in (None, "unknown", ""):
             continue
         overrides[f.name] = val
-    return _apply_overrides(overrides, metadata, source, "spec_xml")
+    return _apply_overrides(overrides, metadata, source, "spec_xml", context=str(path))
 
 
 def _apply_overrides(
@@ -69,6 +73,8 @@ def _apply_overrides(
     metadata: ExperimentParams,
     source: MetadataSource,
     tag: str,
+    *,
+    context: str,
 ) -> tuple[ExperimentParams, MetadataSource]:
     field_map = {f.name: f for f in fields(ExperimentParams)}
     kwargs: dict[str, Any] = {}
@@ -76,42 +82,72 @@ def _apply_overrides(
     for k, v in overrides.items():
         if k not in field_map:
             continue
-        coerced = _coerce(v, field_map[k].type)
-        if coerced is _UNCOERCIBLE:
-            continue
+        try:
+            coerced = _coerce(v, field_map[k].type, field_name=k)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{context}: invalid field {k!r}: {exc}") from exc
         kwargs[k] = coerced
         new_source[k] = tag
     if not kwargs:
         return metadata, new_source
-    new_metadata = replace(metadata, **kwargs)
+    try:
+        new_metadata = replace(metadata, **kwargs)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context}: invalid experiment metadata: {exc}") from exc
     return new_metadata, new_source
 
 
-_UNCOERCIBLE = object()
+_LITERAL_VALUES: dict[str, frozenset[str]] = {
+    "instrument_family": frozenset(
+        {"tof_axial", "tof_reflectron", "qtof", "orbitrap", "fticr", "unknown"}
+    ),
+    "ionization": frozenset({"maldi", "desi", "sims", "esi", "unknown"}),
+    "profile_or_centroided": frozenset({"profile", "centroided", "unknown"}),
+    "polarity": frozenset({"positive", "negative"}),
+    "sample_type": frozenset({"tissue", "cell_culture", "whole_organism", "other"}),
+}
 
 
-def _coerce(value: Any, target_type: Any) -> Any:
+def _coerce(value: Any, target_type: Any, *, field_name: str) -> Any:
     """Best-effort coercion to a Python value matching the dataclass field's type.
 
     ``target_type`` may be a type or a string (PEP 563 deferred annotations); we don't
     parse complex generics — just enough to pick float/int/None/str.
     """
     if value is None:
-        return None
+        if field_name in {"pixel_size_um", "sample_type"}:
+            return None
+        raise TypeError("null is not allowed")
     type_str = str(target_type).lower()
     if "float" in type_str or "int" in type_str:
         if isinstance(value, str) and value.strip() == "":
-            return None
+            if field_name == "pixel_size_um":
+                return None
+            raise TypeError("an empty string is not a number")
+        if isinstance(value, bool):
+            raise TypeError("boolean is not a number")
         try:
             f = float(value)
-            return int(f) if "int" in type_str and "float" not in type_str else f
-        except (TypeError, ValueError):
-            return _UNCOERCIBLE
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"expected a number, got {type(value).__name__}") from exc
+        if not math.isfinite(f):
+            raise ValueError("number must be finite")
+        return int(f) if "int" in type_str and "float" not in type_str else f
     if "bool" in type_str:
         if isinstance(value, bool):
             return value
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes"}
         return bool(value)
-    # Strings + Literal aliases just round-trip.
-    return None if (isinstance(value, str) and value.strip() == "") else value
+    if not isinstance(value, str):
+        raise TypeError(f"expected a string, got {type(value).__name__}")
+    value = value.strip() if field_name != "notes" else value
+    if field_name == "sample_type" and not value:
+        return None
+    allowed = _LITERAL_VALUES.get(field_name)
+    if allowed is not None and value not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ValueError(f"expected one of {choices}; got {value!r}")
+    if not value and field_name != "notes":
+        raise ValueError("value must not be empty")
+    return value
