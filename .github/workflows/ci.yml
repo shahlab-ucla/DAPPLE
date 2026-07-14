@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -17,8 +18,10 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     env:
-      QT_QPA_PLATFORM: offscreen
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      PYOPENGL_PLATFORM: glx
       PYTHONUNBUFFERED: "1"
+      QT_QPA_PLATFORM: xcb
 
     steps:
       - name: Check out the tracked tree
@@ -29,6 +32,18 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+
+      - name: Install the Linux GUI runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libegl1 \
+            libgl1 \
+            libgl1-mesa-dri \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            xauth \
+            xvfb
 
       - name: Build source and wheel distributions
         run: |
@@ -68,7 +83,7 @@ jobs:
           python -m pip check
 
       - name: Validate the installed plugin
-        run: dapple-doctor
+        run: xvfb-run --auto-servernum dapple-doctor
 
       - name: Smoke-test installed command wrappers
         run: |
@@ -78,4 +93,4 @@ jobs:
           dapple-analyze-patterns --help >/dev/null
 
       - name: Run tests against the installed wheel
-        run: python -m pytest -m "not real_data"
+        run: xvfb-run --auto-servernum python -m pytest -m "not real_data"
