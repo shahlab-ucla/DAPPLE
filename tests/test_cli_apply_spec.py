@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -11,7 +12,12 @@ import pytest
 from dapple.cli.apply_spec import main as apply_spec_main
 
 
-def _write_spec_for(synth_centroided: Path, spec_path: Path) -> Path:
+def _write_spec_for(
+    synth_centroided: Path,
+    spec_path: Path,
+    *,
+    rois=(),
+) -> Path:
     """Run the recommended pipeline once and save its .spec.xml so the CLI
     has something to reapply."""
     from dapple.io.imzml_reader import read_imzml
@@ -21,6 +27,8 @@ def _write_spec_for(synth_centroided: Path, spec_path: Path) -> Path:
     from dapple.pipeline.pipeline import Node
 
     ds = read_imzml(synth_centroided)
+    if rois:
+        ds = ds.with_rois(tuple(rois))
     p = recommend_pipeline(ds.metadata)
     nodes = list(p.nodes)
     for i, n in enumerate(nodes):
@@ -35,12 +43,16 @@ def _write_spec_for(synth_centroided: Path, spec_path: Path) -> Path:
             )
             break
     p = p.__class__(nodes=tuple(nodes), rng_seed=p.rng_seed, library_versions=p.library_versions)
-    prov = make_provenance(plugin_version="0.1.0.dev0", input_dataset_hash=ds.hash())
+    prov = make_provenance(
+        plugin_version="0.1.0.dev0",
+        input_dataset_hash=ds.hash(),
+        roi_definitions=ds.rois,
+    )
     write_spec_xml(spec_path, pipeline=p, experiment_params=ds.metadata, provenance=prov)
     return spec_path
 
 
-def test_apply_spec_end_to_end(synth_centroided, tmp_path):
+def test_apply_spec_end_to_end(synth_centroided, tmp_path, capsys):
     spec_path = tmp_path / "saved.spec.xml"
     _write_spec_for(synth_centroided, spec_path)
 
@@ -51,9 +63,13 @@ def test_apply_spec_end_to_end(synth_centroided, tmp_path):
     assert rc == 0
     assert (out_base.with_suffix(".imzML")).exists()
     assert (out_base.with_suffix(".ibd")).exists()
+    assert (out_base.with_suffix(".dapple-axis.json")).exists()
     assert (out_base.with_suffix(".tif")).exists()
     assert (out_base.parent / (out_base.stem + "_channels.csv")).exists()
     assert (out_base.with_suffix(".spec.xml")).exists()
+    output = capsys.readouterr().out
+    assert "out.dapple-axis.json" in output
+    assert "6 output file(s) written" in output
 
 
 def test_apply_spec_no_imzml_flag(synth_centroided, tmp_path):
@@ -131,3 +147,71 @@ def test_apply_spec_unrecognized_input_returns_1(tmp_path, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "unrecognized" in err.lower() or "expected" in err.lower()
+
+
+def test_apply_spec_does_not_silently_reuse_rois_on_different_input(
+    synth_centroided, tmp_path, capsys
+):
+    from dapple.data.metadata import RoiDef
+    from dapple.io.spec_xml import read_spec_xml
+
+    roi = RoiDef(
+        name="foreground",
+        vertices=((0.0, 0.0), (0.0, 2.0), (2.0, 0.0)),
+    )
+    spec_path = _write_spec_for(
+        synth_centroided,
+        tmp_path / "with_roi.spec.xml",
+        rois=(roi,),
+    )
+
+    # The exact hash-matched input restores the ROI automatically.
+    same_base = tmp_path / "same"
+    assert apply_spec_main(
+        [
+            str(synth_centroided),
+            str(spec_path),
+            "-o",
+            str(same_base),
+            "--no-imzml",
+            "--no-tiff",
+        ]
+    ) == 0
+    _, _, same_prov = read_spec_xml(same_base.with_suffix(".spec.xml"))
+    assert same_prov.roi_definitions == (roi,)
+
+    # A byte-identical pair at a different source path has a different dataset
+    # identity and must not inherit pixel coordinates without explicit consent.
+    copied_imzml = tmp_path / "different.imzML"
+    copied_ibd = tmp_path / "different.ibd"
+    shutil.copy2(synth_centroided, copied_imzml)
+    shutil.copy2(synth_centroided.with_suffix(".ibd"), copied_ibd)
+    different_base = tmp_path / "different_out"
+    assert apply_spec_main(
+        [
+            str(copied_imzml),
+            str(spec_path),
+            "-o",
+            str(different_base),
+            "--no-imzml",
+            "--no-tiff",
+        ]
+    ) == 0
+    _, _, different_prov = read_spec_xml(different_base.with_suffix(".spec.xml"))
+    assert different_prov.roi_definitions == ()
+    assert "saved ROIs were not restored" in capsys.readouterr().err
+
+    opted_base = tmp_path / "opted_in"
+    assert apply_spec_main(
+        [
+            str(copied_imzml),
+            str(spec_path),
+            "-o",
+            str(opted_base),
+            "--no-imzml",
+            "--no-tiff",
+            "--reuse-rois",
+        ]
+    ) == 0
+    _, _, opted_prov = read_spec_xml(opted_base.with_suffix(".spec.xml"))
+    assert opted_prov.roi_definitions == (roi,)

@@ -196,7 +196,7 @@ def test_node_card_per_card_reset(qtbot, viewer, synth_centroided):
     assert coarse_widget.value() == pytest.approx(original)
 
 
-# ---- Wizard size policies + sample_type drop -----------------------------------
+# ---- Wizard size policies + developmental metadata -----------------------------
 
 
 def test_wizard_can_shrink_horizontally(qtbot, viewer):
@@ -212,7 +212,9 @@ def test_wizard_can_shrink_horizontally(qtbot, viewer):
     )
 
 
-def test_paramspage_does_not_expose_sample_type(qtbot, viewer, synth_centroided):
+def test_paramspage_exposes_sample_type_for_spatial_recommendations(
+    qtbot, viewer, synth_centroided
+):
     from dapple.io.imzml_reader import read_imzml
     from dapple.widgets._session import MsiSession
     from dapple.widgets.wizard import ParamsPage, WizardWidget
@@ -224,8 +226,11 @@ def test_paramspage_does_not_expose_sample_type(qtbot, viewer, synth_centroided)
         wiz.page(i) for i in range(7) if isinstance(wiz.page(i), ParamsPage)
     )
     page.initializePage()
-    # sample_type intentionally absent: no current operator consumes it.
-    assert "sample_type" not in page._inputs  # noqa: SLF001
+    assert "sample_type" in page._inputs  # noqa: SLF001
+    sample_widget = page._inputs["sample_type"]  # noqa: SLF001
+    sample_widget.setCurrentText("tissue")
+    assert page.validatePage()
+    assert wiz.session.dataset.metadata.sample_type == "tissue"
 
 
 def test_paramspage_validate_preserves_sample_type_from_dataset(

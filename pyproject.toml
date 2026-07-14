@@ -7,7 +7,7 @@ name = "dapple"
 version = "0.1.0.dev0"
 description = "Conservative, reproducible mass-spec imaging in napari"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 license = { file = "LICENSE" }
 authors = [{ name = "dapple contributors" }]
 keywords = ["napari", "mass-spectrometry", "imaging", "MSI", "imzML"]
@@ -24,26 +24,28 @@ classifiers = [
 ]
 dependencies = [
     "napari>=0.6,<0.7",
-    "magicgui>=0.10,<0.11",
     "qtpy>=2.4",
     "numpy>=2.1,<3",
     "scipy>=1.16,<2",
     "pandas>=2.2",
     "scikit-image>=0.24",
     "scikit-learn>=1.4",
-    "dask[array]>=2024.1",
-    "zarr>=2.18,<3",
     "pyimzml>=1.5",
     "tifffile>=2024.8",
     "imagecodecs",
     "netCDF4>=1.7",
     "lxml>=5",
-    "psutil>=5.9",
     "pyqtgraph>=0.13",
 ]
 
 [project.optional-dependencies]
+gui = [
+    # DAPPLE's tested desktop binding. CLI-only users may omit this extra;
+    # base dependencies still include napari, QtPy, and pyqtgraph.
+    "PyQt6>=6.7,<7",
+]
 dev = [
+    "build>=1.2",
     "pytest>=8",
     "pytest-qt>=4.4",
     "pytest-cov>=5",
@@ -52,13 +54,17 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
 ]
+# Experimental backend-detection extras. Current DAPPLE analysis kernels remain
+# CPU-bound; installing these does not yet accelerate a pipeline.
 cuda = ["torch", "onnxruntime-gpu"]
 directml = ["torch-directml", "onnxruntime-directml"]
 mps = ["torch"]
 
 [project.urls]
-Homepage = "https://github.com/napari/dapple"
-"Bug Tracker" = "https://github.com/napari/dapple/issues"
+Homepage = "https://github.com/shahlab-ucla/DAPPLE"
+Source = "https://github.com/shahlab-ucla/DAPPLE"
+Documentation = "https://github.com/shahlab-ucla/DAPPLE/tree/main/docs"
+"Bug Tracker" = "https://github.com/shahlab-ucla/DAPPLE/issues"
 
 [project.entry-points."napari.manifest"]
 dapple = "dapple:napari.yaml"
@@ -66,6 +72,8 @@ dapple = "dapple:napari.yaml"
 [project.scripts]
 dapple-apply-spec = "dapple.cli.apply_spec:main"
 dapple-cohort-align = "dapple.cli.cohort_align:main"
+dapple-doctor = "dapple.cli.doctor:main"
+dapple-analyze-patterns = "dapple.cli.analyze_patterns:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dapple"]
@@ -80,7 +88,7 @@ packages = ["src/dapple"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "real_data: requires real datasets at C:/Users/pavak/MSI/datasets (gated by MSI_REAL_DATA=1)",
+    "real_data: requires MSI_REAL_DATA=1 and datasets under MSI_DATA_DIR",
     "slow: long-running tests",
 ]
 filterwarnings = [

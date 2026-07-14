@@ -107,7 +107,49 @@ def test_imzml_experiment_json_alias(synth_centroided):
         sidecar.unlink()
 
 
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (["not", "an", "object"], "top-level JSON must be an object"),
+        ({"mz_min": [100]}, "invalid field 'mz_min'"),
+        ({"profile_or_centroided": "continuous"}, "expected one of"),
+    ],
+)
+def test_imzml_json_sidecar_rejects_malformed_schema(
+    synth_centroided, payload, message
+):
+    """Known metadata fields fail clearly instead of being skipped or leaking
+    an internal coercion error."""
+    sidecar = synth_centroided.with_suffix(".metadata.json")
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        with pytest.raises(ValueError, match=message):
+            read_imzml(synth_centroided)
+    finally:
+        sidecar.unlink(missing_ok=True)
+
+
+def test_imzml_json_sidecar_reports_invalid_json_with_path(synth_centroided):
+    sidecar = synth_centroided.with_suffix(".metadata.json")
+    sidecar.write_text("{broken", encoding="utf-8")
+    try:
+        with pytest.raises(ValueError, match=r"metadata\.json.*could not read metadata JSON"):
+            read_imzml(synth_centroided)
+    finally:
+        sidecar.unlink(missing_ok=True)
+
+
 # ---- .spec.xml sidecar overlay --------------------------------------------------
+
+
+def test_imzml_invalid_spec_sidecar_is_reported_not_silently_ignored(synth_centroided):
+    spec_path = synth_centroided.with_suffix(".spec.xml")
+    spec_path.write_text("<not-a-dapple-spec/>", encoding="utf-8")
+    try:
+        with pytest.raises(ValueError, match=r"spec\.xml.*could not load"):
+            read_imzml(synth_centroided)
+    finally:
+        spec_path.unlink(missing_ok=True)
 
 
 def test_imzml_spec_xml_sidecar_overrides(synth_centroided, tmp_path):

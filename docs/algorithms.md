@@ -29,12 +29,16 @@ committed, this document explains why — and what would push you up or down.
 14. [Operator: hot_pixel_filter](#operator-hot_pixel_filter)
 15. [Operator: background_subtract](#operator-background_subtract)
 16. [Cohort harmonization](#cohort-harmonization)
-17. [Per-pixel projections](#per-pixel-projections)
-18. [Pipeline runner: caching, hashing, RNG](#pipeline-runner-caching-hashing-rng)
-19. [Diagnostic rubric & health checks](#diagnostic-rubric--health-checks)
-20. [Reproducibility manifest (`.spec.xml`)](#reproducibility-manifest-specxml)
-21. [Harmonized imzML round-trip](#harmonized-imzml-round-trip)
-22. [Headless CLIs](#headless-clis)
+17. [ROI enrichment analysis](#roi-enrichment-analysis)
+18. [Directed developmental-axis analysis](#directed-developmental-axis-analysis)
+19. [Analysis export](#analysis-export)
+20. [Per-pixel projections](#per-pixel-projections)
+21. [Pipeline runner: caching, hashing, RNG](#pipeline-runner-caching-hashing-rng)
+22. [Diagnostic rubric & health checks](#diagnostic-rubric--health-checks)
+23. [Reproducibility manifest (`.spec.xml`)](#reproducibility-manifest-specxml)
+24. [Harmonized imzML round-trip](#harmonized-imzml-round-trip)
+25. [Current computational limits](#current-computational-limits)
+26. [Command-line workflows](#command-line-workflows)
 
 ---
 
@@ -54,20 +58,25 @@ attached by `detect_reference_ions`), and return:
 
 ```mermaid
 flowchart LR
-  IN[MSIDataset<br/>PeakList backend] --> R[detect_reference_ions]
+  IN[MSIDataset<br/>PeakList backend] --> MODE{"profile data?"}
+  MODE -- yes --> P0[cwt_peak_pick]
+  MODE -- no --> R[detect_reference_ions]
+  P0 --> R
   R --> T[empirical_tolerance_from_reference_ions]
   T -. TOF / Q-TOF .-> RC[msiwarp_recalibrate]
   T --> N[median_normalize]
   RC --> N
-  N --> P[snr_peak_pick<br/>or cwt_peak_pick]
+  N -. centroided .-> P[snr_peak_pick]
   P --> C[kde_consensus_alignment]
+  N -. profile already centroided .-> C
   C --> OUT[MSIDataset<br/>PeakMatrix backend]
   C -. tissue .-> SF[morans_i_permutation]
   SF --> OUT
   C -.attaches.-> EX[("extra:<br/>tolerance_curve,<br/>reference_set,<br/>consensus_prevalence")]
 ```
 
-Operators are *idempotent given the same input + params + library versions*.
+Operators are deterministic given the same input, parameters, derived node RNG,
+and library versions.
 The `PipelineRunner` exploits that to short-circuit unchanged nodes via a
 content-addressed cache. See
 [Pipeline runner](#pipeline-runner-caching-hashing-rng).
@@ -76,22 +85,23 @@ content-addressed cache. See
 
 ## Recommended pipeline
 
-`recommend_pipeline(ep: ExperimentParams)` builds the default chain from the
-ExperimentParams:
+`recommend_pipeline(ep: ExperimentParams)` produces one of two orders:
 
-| # | Operator | When |
-| - | :------- | :---- |
-| 1 | `detect_reference_ions` | always |
-| 2 | `empirical_tolerance_from_reference_ions` | always |
-| 3 | `msiwarp_recalibrate` | TOF / Q-TOF only (Orbitrap / FT-ICR / unknown skip) |
-| 4 | `median_normalize` | always (TIC and reference-ion variants are offered) |
-| 5 | `snr_peak_pick` or `cwt_peak_pick` | SNR for centroided, CWT for profile |
-| 6 | `kde_consensus_alignment` | always |
-| 7 | `morans_i_permutation` | tissue samples only (`sample_type == "tissue"`) |
+| Data mode | Default order |
+| :-------- | :------------ |
+| Profile | `cwt_peak_pick` → `detect_reference_ions` → empirical tolerance → optional TOF/Q-TOF recalibration → median normalization → KDE consensus → optional tissue spatial filter |
+| Centroided | `detect_reference_ions` → empirical tolerance → optional TOF/Q-TOF recalibration → median normalization → `snr_peak_pick` → KDE consensus → optional tissue spatial filter |
 
-`hot_pixel_filter` and `background_subtract` are not in the default chain.
-They're available as opt-in operators you can wedge in via custom pipelines —
-the wizard's WorkflowPage will surface them in a future pass.
+The profile order is scientifically important. Dense profile samples are not
+independent peaks: sending them directly to reference detection makes adjacent
+bins look universally prevalent and can collapse them into false reference
+features. CWT therefore converts each trace to centroids first. It is not run a
+second time after normalization.
+
+`hot_pixel_filter`, `prevalence_fdr_filter`, and `background_subtract` are
+visible opt-in cards in the wizard and remain disabled by default. The Moran's I
+filter is included only for `sample_type == "tissue"`, where spatial coherence
+is a meaningful expectation.
 
 ---
 
@@ -230,8 +240,8 @@ A `ToleranceCurve` attached to `ds.extra["tolerance_curve"]`:
 - `mz_grid` — `(200,) float64`, ascending
 - `ppm_quantile` — `(200,) float64`, the working tolerance
 - `ci_low`, `ci_high` — `(200,) float64`, bootstrap 95% CI band
-- `evaluate(mz)` — interpolates onto arbitrary m/z queries; downstream
-  consumers (consensus alignment, planned recalibration operators) call this.
+- `evaluate(mz)` — interpolates onto arbitrary m/z queries; consensus alignment
+  and recalibration operators call this.
 
 ### Parameters
 
@@ -524,10 +534,14 @@ or more wavelet widths peaks, and emits one (m/z, intensity) per detected peak.
 
 For each pixel:
 
-1. **Resample onto a uniform log-m/z grid.** A constant ppm width is uniform on
-   the resampled axis, which makes the wavelet widths agnostic to absolute m/z.
-   Grid step is `ln(1 + grid_ppm_step · 1e-6)` ≈ `grid_ppm_step · 1e-6` per
-   sample.
+1. **Choose a working grid.** If every pixel shares the same regular linear- or
+   log-m/z grid (and it is within `max_grid_points`), use that native grid
+   directly; interpolation cannot create resolution. Otherwise resample onto a
+   uniform log-m/z grid, where a constant ppm width is uniform. The requested
+   step is `ln(1 + grid_ppm_step · 1e-6)`, but DAPPLE will not interpolate more
+   finely than `max_native_oversampling` times the robust native spacing
+   estimated from up to 32 deterministic pixels, and the result is capped at
+   `max_grid_points`.
 2. **Build wavelet widths** that span the configured ppm range:
    `widths = linspace(log_min_w / log_step, log_max_w / log_step, n_widths)`.
    These map ppm-space peak FWHMs to grid-sample widths.
@@ -543,8 +557,10 @@ For each pixel:
 | :---- | :------ | :------------------ |
 | `width_min_ppm` | 20 | Should be smaller than the narrowest peak you expect — typically 10–30 ppm on Q-TOF / reflectron TOF, 1–3 ppm on Orbitrap. |
 | `width_max_ppm` | 120 | Should be at least as large as the broadest real peak you expect. Raise to 500 for axial linear MALDI-TOF. |
-| `n_widths` | 8 | Wavelet widths to try, log-spaced between min and max. 16 if narrow peaks are being missed. |
+| `n_widths` | 8 | Wavelet widths tried between the min and max. Raise to 16 if narrow peaks are being missed. |
 | `grid_ppm_step` | 5 | Tighter grid → sharper centroids but more compute. Should be smaller than ``width_min_ppm``. |
+| `max_grid_points` | 1,000,000 | Hard safety cap on a resampled per-pixel grid. Reaching it coarsens the effective step. |
+| `max_native_oversampling` | 8 | Maximum interpolation density relative to observed sampling. Lower for speed; interpolation beyond native information does not add mass resolution. |
 | `min_snr` | 3 | scipy ``find_peaks_cwt`` SNR floor; raise to 5 for stricter picking. |
 | `noise_perc` | 10 | CWT-coefficient percentile used as the noise floor. Raise to 25 if real signals are themselves dense. |
 
@@ -555,15 +571,20 @@ gets much wider widths.
 
 ### Diagnostic
 
-`summary` keys: `n_peaks_total`, kept-per-pixel min/median/max,
-``grid_size``, ``n_widths``, ``min_snr``. Payload: ``per_pixel_kept_count``.
+`summary` keys: `n_peaks_total`, kept-per-pixel min/median/max, requested and
+effective grid size/ppm step, `grid_capped`,
+`grid_limited_by_native_resolution`, `native_grid_used`, `n_failed_pixels`,
+`n_widths`, and `min_snr`. Payload: `per_pixel_kept_count`.
 
 ### Notes
 
-Profile-mode peak picking is fundamentally an interpolation problem (true peak
-m/z lies between sampled points), so the sub-grid centroid step matters as much
-as the CWT itself. ``find_peaks_cwt`` only gives an integer index; without
-centroid refinement the picked m/z would be quantized to the grid step.
+Profile-mode peak picking is a localization problem: true peak m/z can lie
+between working-grid samples, so the local centroid step matters as much as the
+CWT itself. `find_peaks_cwt` only gives an integer index; without centroid
+refinement the picked m/z would be quantized to the grid step. A
+`grid_capped` or `grid_limited_by_native_resolution` diagnostic is not itself a
+failure; it states that the requested interpolation resolution exceeded a
+configured or information-based bound.
 
 ---
 
@@ -592,32 +613,38 @@ hyperspectral-cube-construction step.
    of 50 corresponds to a Gaussian SD of `5e-5` in log-m/z, which is exactly
    50 ppm in linear m/z to first order.
 
-   Evaluate the KDE on a regular log-m/z grid of `n_grid_points` points,
-   padded by `5 · bw` past the data range to avoid boundary bias (the kernel
-   spilling off the edge would otherwise underestimate density at boundary
-   peaks):
+   Build a regular log-m/z grid padded by `5 · bw` past the data range to avoid
+   boundary bias. `n_grid_points` is a minimum, not a fixed resolution: the
+   grid is refined to at least four samples per bandwidth and capped at
+   2,000,000 points. The diagnostic reports the effective spacing and whether
+   that cap was reached.
 
    $$\hat{f}(x_g) = \frac{1}{\sqrt{2\pi}\, bw\, \sum_i w_i} \sum_i w_i \exp\left(-\frac{(x_g - x_i)^2}{2 bw^2}\right)$$
 
-   The implementation truncates the kernel at ±5σ via a binary search on the
-   sorted log-m/z values, so the cost is O((n + g) log n) rather than O(n·g).
+   Rather than evaluate every sample at every grid point, the implementation
+   deposits weighted samples linearly into a histogram and applies a Gaussian
+   convolution. Cost is approximately O(n + g), where `n` is the number of
+   pooled peaks and `g` is the effective grid length.
 
 3. **Find local maxima.** Indices `i` where
    `density[i-1] < density[i] > density[i+1]`. We record **all** local
    maxima for the rejection-budget diagnostic — see below.
 
-4. **Prominence filter.** Keep maxima whose density exceeds
-   `quantile(density, min_prominence_quantile)` (default 0.5, the median
-   density). Maxima below the threshold are dropped.
+4. **Prominence filter.** Keep maxima whose density exceeds the requested
+   quantile of the **positive KDE grid density** (default 0.5, its median).
+   If no positive grid values exist, the full density is used. Maxima below the
+   resulting density threshold are dropped.
 
 5. **Per-pixel assignment.** For each candidate consensus m/z `c_k`, the
    tolerance window is
    `c_k · (1 ± tol_k · 1e-6)` where `tol_k` is the empirical tolerance from
    `ds.extra["tolerance_curve"]` evaluated at `c_k`, or `default_tol_ppm` if
-   no curve is attached. For each peak we look up the two nearest consensus
-   m/z values via `searchsorted`; if either's window contains the peak, we
-   assign the peak to that consensus and keep the **maximum** intensity per
-   `(pixel, consensus)` pair via `np.maximum.at`.
+   no curve is attached. For each peak we inspect the nearest candidate on
+   either side in log-m/z, keep only candidates whose own tolerance window
+   contains it, and assign the peak to the nearer one. A peak is therefore
+   assigned to **at most one** channel even when windows overlap; exact ties
+   deterministically choose the lower-m/z (left) candidate. Multiple peaks from
+   one pixel that map to the same channel are reduced by maximum intensity.
 
 6. **Prevalence filter.** A consensus channel's prevalence is
    `(matrix[:, k] > 0).sum() / n_pixels`. Drop channels with
@@ -645,29 +672,40 @@ ask:
 
 - *"If I raise `min_prevalence` to 0.1, how many channels survive?"* →
   `(all_candidate_prevalence >= 0.1).sum()`
-- *"What if `min_prominence_quantile` were 0.7?"* →
-  `(all_local_max_density > quantile(all_local_max_density_distribution, 0.7)).sum()`
+- *"What if I raise the density cutoff?"* → compare
+  `all_local_max_density` directly with a proposed density value. The operator's
+  current density cutoff is `prominence_threshold_value`.
 
-A future panel will surface this as live sliders.
+The Threshold Explorer surfaces these arrays as live what-if sliders. Its
+prominence slider is in **KDE density units**, whereas the workflow parameter is
+a **density quantile**. Use that view to decide whether to move
+`min_prominence_quantile` up or down; do not copy the density value into the
+quantile field. Applying a choice still requires editing the workflow card and
+re-running.
 
 ### Parameters
 
 | Field | Default | Adjustment guidance |
 | :---- | :------ | :------------------ |
-| `n_grid_points` | 32768 | More → sharper detection but slower. ~21 ppm spacing across 200–800 m/z. |
+| `n_grid_points` | 32768 | Minimum grid size. DAPPLE refines to ≥4 points per bandwidth, capped at 2,000,000. |
 | `bandwidth_ppm` | 50 (Q-TOF/reflectron); 5 (Orbitrap/FT-ICR); 200 (axial TOF) | Match to per-pixel m/z scatter. Tighten if peaks are unusually well-resolved; widen if drift is large. |
 | `bandwidth_scale` | 1.0 | Multiplier on `bandwidth_ppm`. < 1 sharpens, > 1 merges. Prefer this knob over editing `bandwidth_ppm`. |
 | `min_prominence_quantile` | 0.5 (median density) | Raise to 0.7–0.9 for stricter selection. |
 | `default_tol_ppm` | family-aware (5 / 50 / 200) | Used only when no `tolerance_curve` is upstream. |
-| `min_prevalence` | 0.05 | Drop peaks present in < 5% of pixels. A permutation-FDR alternative is planned. |
+| `min_prevalence` | 0.05 | Drop peaks present in < 5% of pixels. Declare this threshold before comparing images; the optional occupancy filter is experimental sensitivity analysis only. |
 
 ### Notes
 
-The conservative `min_prevalence` floor applied here can be replaced (or
-followed) by the empirical permutation-FDR test
-[`prevalence_fdr_filter`](#operator-prevalence_fdr_filter), which adapts to
-each channel's total peak count rather than imposing a fixed prevalence
-threshold across all channels.
+The conservative `min_prevalence` floor is the recommended single-image
+filter. The optional
+[`prevalence_fdr_filter`](#operator-prevalence_fdr_filter) can be run only as
+an exploratory sensitivity analysis; its with-replacement occupancy model is
+not calibrated after peak picking and consensus selection.
+
+If `kde_grid_capped == 1`, an extremely wide m/z span combined with a very
+narrow bandwidth could not attain four samples per bandwidth. Treat apparently
+merged or missed close peaks cautiously; narrow the analyzed range, increase
+the bandwidth, or compare the DBSCAN variant.
 
 ---
 
@@ -740,18 +778,19 @@ Module: [`ops/prevalence_filter.py`](../src/dapple/ops/prevalence_filter.py)
 
 ### Purpose
 
-Empirical replacement for the conservative ``min_prevalence`` floor inside
-the consensus operators. Tests, per channel, whether the observed prevalence
-is higher than the random-placement null would produce — and drops channels
-that fail to reject.
+Experimental sensitivity analysis that compares a consensus channel's
+observed prevalence with a simulated with-replacement occupancy distribution.
+It is disabled by default and is **not** a calibrated replacement for
+``min_prevalence``.
 
-Why this is better than a fixed threshold: a flat ``min_prevalence = 0.05``
-treats all channels alike, but the right floor depends on how many *peaks*
-the channel has. A channel with 200 peaks placed at random across 200 pixels
-fills ~63% of pixels by pure chance, so observing 5% prevalence there is
-*below* the null (noise). A channel with 5 peaks placed at random fills
-~2.5%, so observing 5% prevalence is well above the null (signal). The FDR
-test scales the bar per channel; a fixed floor cannot.
+The limitation is structural: consensus channels are selected from the same
+peaks being tested, and peak picking/assignment commonly yields at most one
+assignment per channel and carrier pixel. In that common case ``k_c`` is equal
+or close to the observed carrier count. The simulated null permits repeated
+placements into the same pixel, so an observed collision-free carrier set can
+look spuriously significant even when its pixels are random. Consequently the
+reported p/q values can be anti-conservative and do not support confirmatory
+FDR claims.
 
 ### Algorithm
 
@@ -801,8 +840,8 @@ carries `p_values`, `q_values`, `kept_mask`, `channel_mz_in`, `k_per_channel`,
 
 | Field | Default | Adjustment guidance |
 | :---- | :------ | :------------------ |
-| `n_permutations` | 499 | p-value resolution ~ 1/(B+1). Drop to 99 for fast iteration; raise to 1999 when N_channels > 1000. |
-| `q_threshold` | 0.05 | Standard FDR floor. Raise to 0.1 for permissive; lower to 0.01 for strict. |
+| `n_permutations` | 499 | Occupancy-score resolution ~ 1/(B+1). More draws reduce Monte-Carlo noise but do not repair model calibration. |
+| `q_threshold` | 0.05 | Sensitivity cutoff only. Compare multiple cutoffs; do not interpret 0.05 as confirmatory FDR control. |
 | `min_pixels_for_test` | 64 | Below this the null is too coarse to discriminate — operator passes through. |
 | `rng_seed` | 0 | Mixed with global pipeline seed for deterministic re-runs. |
 
@@ -810,6 +849,8 @@ carries `p_values`, `q_values`, `kept_mask`, `channel_mz_in`, `k_per_channel`,
 
 `summary` keys: `n_channels_in`, `n_channels_out`, `n_dropped_by_fdr`,
 `n_permutations`, `q_threshold`, `p_value_min/median`, `q_value_min/median`.
+`warning_uncalibrated_occupancy_null=1.0` is always set to prevent these
+scores being mistaken for calibrated inference.
 `warning_conservative_fallback=1.0` is set when
 `consensus_n_peaks_per_channel` is missing from `ds.extra` (the operator
 falls back to using the observed pixel count, yielding a conservative test).
@@ -819,19 +860,21 @@ q-values across channels with a vertical line at the threshold.
 
 ### When to use
 
-- After consensus alignment, on any PeakMatrix-backed dataset.
-- Especially when channel counts span a wide range — fixed-floor
-  ``min_prevalence`` over-rejects sparse channels and under-rejects dense
-  ones.
-- Before ``morans_i_permutation``: this filter removes prevalence-noise
-  channels (which Moran's I would call "no spatial structure" anyway); after
-  this filter, Moran's I has fewer channels to test, sharpening its FDR.
+- Only as an explicitly reported sensitivity analysis after consensus
+  alignment, never as the sole production filter.
+- Compare conclusions across several cutoffs and against the declared fixed
+  ``min_prevalence`` result.
+- Prefer cohort `dataset_prevalence` when the scientific claim is that a
+  channel recurs across biological samples.
 
 ### Caveats
 
-- The null assumes peaks are placed *independently* across pixels. If your
-  data has strong spatial structure, the null is appropriate (we're testing
-  for above-random prevalence, structure handled separately).
+- The null is mismatched to consensus selection and per-pixel assignment; it
+  can be anti-conservative even when carrier pixels are random.
+- BH adjustment corrects multiple scores only if their underlying p-values
+  are valid; it cannot repair this null-model mismatch.
+- Pixel-level evidence is not a substitute for independent biological
+  replicates.
 - Computational cost is O(B * Σ k_c) — manageable up to a few thousand
   channels each with a few hundred peaks.
 
@@ -1015,34 +1058,49 @@ it independently on dataset A and dataset B, the two output PeakMatrix
 backends will have *different* m/z axes (each axis is fit to its own image),
 making cross-dataset comparison brittle.
 
-``align_cohort`` computes one shared consensus axis from all datasets together,
-then expresses every dataset on that axis. The result is a list of MSIDatasets
-each with the same number of channels in the same order, suitable for stacking
-into a `(n_datasets, n_pixels_per_dataset, n_channels)` tensor for
-downstream cohort-level analysis.
+`align_cohort` computes one shared consensus axis from all datasets together,
+then expresses every dataset on that axis. The returned datasets have the same
+channels in the same order. Pixel counts and raster shapes may differ, so stack
+only after choosing an explicit spatial registration/padding strategy.
 
 ### Algorithm
 
 For each dataset independently:
 
-1. **Reference detection** with ``DetectReferenceIons`` (own params).
-2. **Empirical tolerance** with ``EmpiricalToleranceFromReferenceIons`` (own
-   reference set).
-3. **Optional per-dataset recalibration** with ``MsiwarpRecalibrate`` when
-   ``recalibrate=True`` (default). Each dataset is recalibrated against its
-   own reference set — drift is corrected *before* pooling.
-4. **Per-pixel normalization** with ``MedianNormalize``.
-5. **Per-pixel peak picking** with ``SnrPeakPick`` (centroided) or
-   ``CwtPeakPick`` (profile, picked from each dataset's metadata).
+1. For profile data, **CWT centroid first**. Centroided inputs skip this step.
+2. Detect reference ions and fit the empirical tolerance curve.
+3. Optionally run per-dataset MSIWarp for TOF/Q-TOF families. Each image uses
+   its own references, so drift is corrected before pooling.
+4. Optionally median-normalize within the dataset.
+5. For centroided data, run the SNR filter. Profile data is not picked twice.
 
-After per-dataset preprocessing, all picked peaks (across all pixels of all
-datasets) are pooled into a single weighted (intensity-weighted) sample. A
-single KDE consensus is fit on the pooled cloud — this is the **shared
-consensus axis**, identical across the cohort. Each dataset is then projected
-onto that axis using its own picked peaks: for every pixel, for every
-consensus m/z, the maximum intensity within the consensus channel's tolerance
-window is recorded. Output is a `PeakMatrix` per dataset, all sharing the same
-`mz_axis`.
+The post-pick peaks are then pooled and a single adaptive-grid KDE finds shared
+candidate m/z values. `pool_weighting="sample"` (default) normalizes the
+nonnegative KDE weights within each dataset to sum to one. Every dataset thus
+has equal total influence on peak discovery, independent of pixel count or
+overall signal. A zero-total dataset distributes its unit weight uniformly over
+its peaks. `pool_weighting="intensity"` retains raw peak-intensity weights and
+can be useful for deliberately exposure-weighted analyses, but larger or
+brighter datasets can dominate.
+
+Each input peak is uniquely assigned to the nearest eligible candidate and
+maximum-aggregated per pixel/channel. Candidate prevalence is computed two
+ways before filtering:
+
+$$p_{pixel,k} = \frac{\text{cohort pixels carrying channel }k}
+                         {\text{all cohort pixels}}$$
+
+$$p_{dataset,k} = \frac{\text{datasets with at least one carrier of }k}
+                           {\text{number of datasets}}$$
+
+`prevalence_basis` selects which vector is compared inclusively with
+`min_prevalence`; both are retained in the result. Pixel prevalence lets large
+datasets contribute more votes and answers "how common is this across all
+measured pixels?" Dataset prevalence gives each dataset one vote and answers
+"in how many samples was this channel detected at least once?" The latter is
+not a biological effect test: one carrier is enough to mark a dataset present.
+If no candidate survives, alignment raises and reports the maximum observed
+prevalence instead of silently returning an empty matrix.
 
 ### Per-dataset metadata
 
@@ -1050,6 +1108,8 @@ Each output dataset carries:
 
 - ``extra["cohort_dataset_index"]`` — its position in the input list
 - ``extra["cohort_size"]`` — total cohort size
+- ``extra["cohort_dataset_prevalence"]`` — fraction of datasets carrying each
+  retained channel
 
 so that downstream operators or analysis code can re-identify cohort members
 and scope their reductions.
@@ -1059,42 +1119,175 @@ and scope their reductions.
 | Field | Default | Adjustment guidance |
 | :---- | :------ | :------------------ |
 | `bandwidth_ppm` | 50 | Same role as in KDE consensus. Tighten when cohort drift is small; widen when drift dominates. |
-| `min_prevalence` | 0.5 | The fraction of *cohort pixels* required to keep a consensus channel. Higher than the single-dataset default because cohort pooling already smooths sparsity. |
+| `min_prevalence` | 0.05 | Inclusive floor on the vector selected by `prevalence_basis`. |
 | `min_prominence_quantile` | 0.5 | Inherited from KDE consensus. |
+| `pool_normalize` | `True` | Median-normalize each dataset before pooling. Disable only for already comparable external normalization. |
 | `recalibrate` | `True` | Per-dataset MSIWarp before pooling. Disable only if your datasets are already recalibrated or if MSIWarp is known to fail on your instrument family. |
+| `pool_weighting` | `"sample"` | Equal total KDE weight per dataset. `"intensity"` restores raw pooled-intensity weighting. |
+| `prevalence_basis` | `"pixel"` | Filter on all-pixel prevalence, or choose `"dataset"` for one presence/absence vote per dataset. |
+| `rng_seed` | 0 | Master seed. Per-dataset/per-stage seeds include dataset identity, so reordering inputs does not change a dataset's stochastic preprocessing. |
 
 ### Output (`CohortAlignResult`)
 
-A frozen dataclass with:
+A result dataclass with:
 
 - `aligned_datasets` — list of `MSIDataset` with `PeakMatrix` backends
 - `shared_consensus_mz` — `(K,) float64`, the shared m/z axis
 - `cohort_prevalence` — `(K,) float64`, fraction of *all cohort pixels* with
   signal in each channel
+- `dataset_prevalence` — `(K,) float64`, fraction of datasets with at least one
+  carrying pixel
 - `per_dataset_prevalence` — `dict[int, (K,) float64]`, per-dataset prevalence
 - `diagnostics` — summary dict (`n_datasets`, `n_total_pixels`,
   `n_total_peaks_pooled`, `n_consensus_shared`, `cohort_prevalence_median`)
 
 ### Loading a cohort
 
-`load_cohort_directory(root, pattern="*.imzML", recursive=True)` walks the
-directory and reads every matching file. Files are returned sorted by name.
+`load_cohort_directory(root, pattern="*.imzML", recursive=False)` reads the
+matching files in sorted order. The CLI and widget first freeze their discovered
+file list and exclude a separate output directory, preventing a recursive run
+from ingesting its own previous outputs.
 Use this when your cohort is organized as `cohort_root/{run1.imzML,
 run2.imzML, ...}`.
 
 ### Notes
 
-The pooled-consensus approach is the simplest defensible cohort harmonization:
-each dataset is fit, recalibrated, and picked independently (so per-dataset
-issues don't bleed into other datasets), and the only cross-dataset step is
-pooling for the shared axis.
+The pooled-consensus approach harmonizes channel identity; it does not correct
+batch effects, register anatomy, or turn pixels into independent replicates.
+Use `per_dataset_prevalence` and sample-level summaries to inspect heterogeneity
+before pooling downstream biological inference.
 
 A more aggressive alternative — fitting a *single* global tolerance curve and
 recalibration warp from cross-dataset reference intersections — is not yet
 implemented. It would be slightly more powerful when the cohort spans the same
 instrument run with consistent reference ions, but is fragile when the cohort
-mixes instruments or sample types. The current approach is conservative and
-extends to mixed-cohort settings without changes.
+mixes instruments or sample types. Mixed-instrument cohorts still require
+careful bandwidth, tolerance, normalization, and batch-effect review.
+
+---
+
+## ROI enrichment analysis
+
+Modules: [`analysis/spatial.py`](../src/dapple/analysis/spatial.py),
+[`analysis/developmental.py`](../src/dapple/analysis/developmental.py)
+
+`analyze_roi_enrichment` is a read-only, post-harmonization analysis. It requires
+a shared-axis `PeakMatrix`; it never changes or filters the input dataset.
+The same core is used by the **Spatial and developmental patterns** widget and
+`dapple-analyze-patterns`, so GUI, CLI, and Python results share semantics.
+
+### Geometry and overlap semantics
+
+`rasterize_rois(ds, rois=None, overlap_policy="error")` converts `RoiDef`
+polygons from zero-based napari `(y, x)` coordinates to membership over the
+dataset's populated pixels. ROI names must be unique. The policy is explicit:
+
+| Policy | Meaning |
+| :----- | :------ |
+| `error` | Reject any populated pixel covered by more than one polygon. This is the conservative default. |
+| `exclude` | Remove multiply covered pixels from every ROI. |
+| `first` | Assign an overlap to the first polygon in input order. |
+| `allow` | Preserve all memberships; useful for descriptions, but an enrichment contrast still rejects shared pixels between its two arms. |
+
+`RoiMasks.overlap_mask` always records the original overlaps, even when the
+chosen policy resolves them. `RoiMasks.union(("roi_a", "roi_b"))` forms a named
+union, and `fingerprint` hashes the analysis-visible names, policy, and masks.
+
+### Descriptive effects and pixel-level screen
+
+`analyze_roi_enrichment(ds, roi_masks, numerator, denominator, ...)` accepts one
+name or a union of names in each contrast arm. For every shared-m/z channel it
+reports mean, median, 10%-trimmed mean by default, nonzero prevalence, and:
+
+$$\log_2 FC = \log_2\left(
+  \frac{\operatorname{trimmean}(I_{numerator}) + c_k}
+       {\operatorname{trimmean}(I_{denominator}) + c_k}
+\right)$$
+
+The adaptive pseudocount `c_k` is half the channel's configured low positive
+intensity quantile (5% by default), floored at `1e-12`; an all-zero channel uses
+1. Positive `log2_fold_change` always means numerator-enriched. The effect uses
+raw-intensity centers so it keeps a fold-change interpretation. Separately,
+Welch's t test compares pixel values after `log2(I + c_k)`, and
+Benjamini-Hochberg adjustment is applied across finite channel p-values.
+Undefined zero-variance tests retain NaN p/q values and produce `partial`
+status. If either arm has fewer than `min_units_per_group` pixels, descriptive
+effects remain available but inference is skipped as `insufficient_units`.
+
+These p-values use **pixels as inference units**. They are useful for
+within-image screening, not population-level evidence: spatial autocorrelation
+and pseudoreplication can make them optimistic. With independent specimens,
+aggregate each ROI within each specimen first and perform the biological test
+on those specimen-level summaries. Do not substitute a large pixel count for a
+large replicate count.
+
+---
+
+## Directed developmental-axis analysis
+
+`DirectedAxis(name, start_yx, end_yx, start_label=..., end_label=...,
+half_width_px=...)` defines a finite straight segment in zero-based napari
+`(y, x)` coordinates. `project_to_axis` gives included populated pixels a
+normalized coordinate `t=0` at the named start and `t=1` at the named end;
+pixels beyond the endpoints, outside `half_width_px`, or outside an optional
+mask are excluded. Signed perpendicular distance flips sign when the axis is
+reversed.
+
+`analyze_axis_profiles` divides `[0, 1]` into `n_bins` equal bins and returns raw
+mean/median intensity, mean `log2(I + c_k)`, and nonzero prevalence for every
+bin/channel. Bins below `min_pixels_per_bin` remain descriptive but do not enter
+trend inference. If fewer than `min_bins_for_trend` valid bins remain, p/q
+values are NaN and status is `insufficient_bins`.
+
+For each channel, the ordered trend is Spearman's rho between bin order and the
+mean log-intensity profile. The empirical two-sided null shuffles bin order;
+each random ordering is paired with its reversal, giving
+`2 * n_permutations` effective permutations. BH correction is across channels.
+Endpoint enrichment is the trimmed-mean log2 ratio **end over start**, using
+pixels in the first and last `endpoint_fraction` of the directed segment:
+
+$$E_k = \log_2\left(
+  \frac{\operatorname{trimmean}(I_{end}) + c_k}
+       {\operatorname{trimmean}(I_{start}) + c_k}
+\right)$$
+
+The result also reports peak position and an entropy-based concentration from
+0 (diffuse) to 1 (localized). Labels are assigned in this precedence order:
+`undetected`; significant `increasing`/`decreasing`; concentrated
+`start_localized`/`end_localized`/`interior_localized`; effect-only
+`start_enriched`/`end_enriched`; otherwise `diffuse_or_complex`. They are
+threshold-based summaries, not molecular annotations.
+
+Direction is part of the hypothesis. `axis.reversed()` swaps endpoint labels;
+rho and endpoint enrichment change sign, peak position maps to `1 - t`, and
+the two-sided permutation p/q values and concentration remain invariant for the
+same seed. Always name endpoints anatomically and record orientation before
+comparing specimens.
+
+As with ROI analysis, bins and pixels within one image are spatially dependent.
+The permutation test screens ordered structure in that image; claims about a
+developmental population require replicate-level profiles and a model whose
+independent units are specimens.
+
+---
+
+## Analysis export
+
+`RoiEnrichmentResult.to_frame()`, `AxisProfileResult.profile_frame()`, and
+`AxisProfileResult.statistics_frame()` return pandas tables.
+`export_analysis_result(result, output_dir, stem="analysis")` writes one ROI
+CSV or two axis CSVs plus a JSON manifest. The manifest records schema version,
+contrast names or axis name/endpoint labels, counts, source-data hash, exact
+axis geometry, scientific analysis parameters, software versions, inference
+status, warnings, table filenames, and the spatial fingerprint.
+
+The fingerprint detects changes in the rasterized ROI membership or directed
+axis geometry/selection. The manifest records axis coordinates directly and a
+source-state fingerprint, but it does not embed spectra, the processing DAG, or
+ROI polygon vertices. Retain the harmonized imzML sidecar and `.spec.xml` with
+the analysis output for full reconstruction. `dapple-analyze-patterns` is the
+installed CLI wrapper; scripts can use these result/export objects as the stable
+in-process contract.
 
 ---
 
@@ -1144,7 +1337,10 @@ Module: [`pipeline/runner.py`](../src/dapple/pipeline/runner.py)
 For each node, the runner computes:
 
 ```
-cache_key = sha256( op_name | params_hash | input_dataset_hash | library_versions_hash )
+cache_key = sha256(
+    op_name | node_id | params_hash | master_rng_seed |
+    input_dataset_hash | library_versions_hash
+)
 ```
 
 where `params_hash` is the canonical SHA-256 of the params dataclass (handled
@@ -1154,10 +1350,22 @@ hash with all upstream `OpRecord.output_hash` values), and
 `library_versions_hash` snapshots installed versions of numpy/scipy/pyimzml
 and friends.
 
+ROI geometry enters the input hash only when the operator class declares
+`depends_on_rois=True`. This keeps upstream numerical work cacheable when a
+user merely edits a polygon while invalidating ROI-dependent background work.
+On an ROI-independent cache hit, the runner rebinds the current ROI definitions
+to the cached numerical dataset so downstream nodes see current annotations.
+
 If the cache key has been seen, the cached `MSIDataset` and diagnostics are
 returned without re-running. So when you go Back in the wizard, edit
 `bandwidth_ppm`, and Run again, only the consensus node re-executes — the
 upstream four are served from cache.
+
+The dataset and diagnostics caches are in memory and belong to one
+`PipelineRunner`; they are not cross-session or on-disk caches. Before storing a
+new result, the runner stamps the latest `OpRecord` with runner-level input and
+output hashes, so node id, seed, parameters, lineage, and detected library
+versions affect downstream provenance.
 
 ### RNG
 
@@ -1168,9 +1376,10 @@ seed_node = int(sha256( {seed: master, node: id} ).hex[:16], 16) & 0xFFFFFFFF
 rng = numpy.random.default_rng(seed_node)
 ```
 
-So the bootstrap CIs from `empirical_tolerance_from_reference_ions` and the
-permutation tests in future operators are reproducible across re-runs given
-the same `master_seed` and node id.
+So bootstrap CIs and permutation tests are reproducible across re-runs given
+the same `master_seed` and node id. Cohort preprocessing separately derives
+each stage seed from the master seed, dataset identity/source, and stage name,
+making it stable to input ordering.
 
 ### Re-runs honor the original input
 
@@ -1241,8 +1450,8 @@ operator plus the cohort flow. Highlights:
 | `lock_mass_recalibrate` | `ppm_shift_abs_median` | < 50 | Above 200 likely indicates bad anchor strategy |
 | `kde_consensus_alignment` / `dbscan_consensus` | `n_consensus_peaks` | ≥ 10 | The user-visible channel count |
 | `dbscan_consensus` | `fraction_noise` | < 0.5 | Above 0.8 means params are too strict |
-| `prevalence_fdr_filter` | `n_channels_out` | ≥ 1 | Zero means every channel was rejected — relax q_threshold |
-| `prevalence_fdr_filter` | `warning_conservative_fallback` | absent | Upstream consensus didn't record n_peaks_per_channel — re-run it |
+| `prevalence_fdr_filter` | `warning_uncalibrated_occupancy_null` | always 1 | Experimental sensitivity scores; do not claim calibrated FDR |
+| `prevalence_fdr_filter` | `warning_conservative_fallback` | absent | Upstream consensus did not record peak counts; the carrier-count fallback was used |
 | `morans_i_permutation` | `n_channels_out` | ≥ 1 | Zero means everything was rejected |
 | `hot_pixel_filter` | `fraction_hot` | ≤ 0.05 | Above 15% means real structure is being clipped |
 | `align_cohort` | `n_consensus_shared` | ≥ 10 | Shared-axis channel count |
@@ -1289,6 +1498,12 @@ A run can be saved as XML for later reapplication. The schema (namespace
     <instrument_family>tof_reflectron</instrument_family>
     ...
   </experimentParams>
+  <spatialDefinitions coordinateSystem="napari-data-yx-zero-based">
+    <roi name="head" isBackground="false" color="#ff7f0e">
+      <vertex y="12.0" x="18.0"/>
+      ...
+    </roi>
+  </spatialDefinitions>
   <pipeline rngSeed="0">
     <node id="ref" op="detect_reference_ions">
       <params>
@@ -1316,13 +1531,21 @@ A run can be saved as XML for later reapplication. The schema (namespace
 `read_spec_xml` reconstructs the `Pipeline` by importing each operator's
 `params_cls` from the `REGISTRY` and instantiating it from the serialized
 field values. `Pipeline.hash(input_hash=...)` is invariant across the
-round-trip, so combining the `.spec.xml` with the original input dataset
-reproduces the run byte-for-byte (modulo timestamps).
+round-trip. With the same input, seed, parameters, node ids, and pinned library
+versions, operators are intended to be deterministic; the stored hashes make
+environment or lineage changes visible.
 
-Heavy diagnostic payloads (bootstrap CI envelopes, KDE curves, per-candidate
-prevalence arrays) are referenced via `<diagnosticsPayload href=".../zarr/">`
-and live in a sibling Zarr — keeps the XML small and human-readable while
-preserving the full rejection-budget arrays for the threshold explorer.
+Wizard saves include every ROI's unique name, background flag, display color,
+and polygon vertices in zero-based napari `(y, x)` coordinates. `read_spec_xml`
+returns these as `ProvenanceInfo.roi_definitions`, and `dapple-apply-spec`
+attaches them before executing ROI-dependent operators. ROI overlap policy is
+an analysis choice and is not serialized; directed axes are recorded in the
+analysis export manifest rather than in `.spec.xml`.
+
+Only diagnostic scalar summaries are written to XML. Array payloads such as
+bootstrap envelopes, KDE curves, and rejection-budget vectors are not
+automatically persisted, and DAPPLE does not currently write a sibling Zarr
+diagnostic store. Export any arrays needed for a long-lived analysis explicitly.
 
 ---
 
@@ -1376,16 +1599,67 @@ reconstruct the dense matrix on load"*. A user who only wants reproducibility
 keeps the spec; a user who wants to continue working on the harmonized output
 needs both, and they're written together.
 
+### What “raw” and “harmonized” mean in the live session
+
+`MsiSession` retains the original `PeakList` when a pipeline result with the
+same dataset identity replaces it with a `PeakMatrix`. The Spectrum Panel's raw
+single-pixel trace then reads the original peaks, while harmonized reads the
+nonzero cells on the shared axis. Raw polygon aggregates have no common native
+axis, so the panel first bins them onto a stable 50-ppm log-m/z grid and labels
+the curve `raw (binned)`; harmonized aggregates reduce the `PeakMatrix`
+directly.
+
+This pairing is session-local. Opening an unrelated dataset clears the retained
+raw input. Opening a harmonized processed file by itself reconstructs the
+`PeakMatrix`, but cannot reconstruct its pre-pipeline raw trace; only the
+harmonized control is available until the corresponding raw input is loaded and
+processed in that session. ROI edits are propagated to both retained views.
+
 ---
 
-## Headless CLIs
+## Current computational limits
 
-Two console scripts are installed by `pip install -e .` (declared in
-`pyproject.toml::[project.scripts]`):
+- imzML and CDF readers currently materialize peak arrays in RAM. The
+  `read_imzml(..., lazy=True)` argument is a compatibility placeholder; it does
+  not provide lazy loading.
+- Consensus creates a dense `(n_pixels, n_channels)` float32 `PeakMatrix` in
+  memory. Some analysis routines read channel chunks from array-like backends,
+  but DAPPLE does not currently install or create a Zarr/Dask backing store.
+- The `cuda`, `directml`, and `mps` extras only support experimental accelerator
+  detection scaffolding. Current processing and analysis kernels execute on the
+  CPU, so installing a GPU extra does not promise a speedup.
+- Pipeline caching is in memory for the lifetime of one runner. There is no
+  persistent cache shared across napari sessions or CLI processes.
+
+Plan memory around peak count and the final dense matrix, keep the KDE grid-cap
+diagnostic visible, and validate runtime on a representative subset before a
+large cohort run.
+
+---
+
+## Command-line workflows
+
+The installed console scripts are declared in `pyproject.toml`. Invoke the same
+modules as `python -m dapple.cli.<name>` when you want to guarantee use of a
+particular virtual environment. These commands do not open a napari window, but
+the base package still depends on napari, QtPy, and pyqtgraph; DAPPLE does not
+currently ship a dependency-minimal headless extra.
+
+### `dapple-doctor`
+
+`dapple-doctor` checks the tested Python 3.11-3.12 range, every required
+analysis/CLI import, all four console entry points and launchers, the Qt binding,
+and napari/npe2 manifest discovery plus every reader/widget command target. It
+also verifies the expected three readers and seven widgets, including
+`CohortWidget`. It exits nonzero on any required failure.
+`dapple-doctor --headless` treats the concrete Qt binding and widget target
+imports as warnings but still requires the scientific stack, CLI launchers,
+plugin manifest, and reader targets; the flag changes validation policy rather
+than installed dependencies.
 
 ### `dapple-apply-spec`
 
-Reapply a saved `.spec.xml` to a fresh input dataset, headless.
+Reapply a saved `.spec.xml` to a fresh input dataset without opening napari.
 
 ```
 dapple-apply-spec INPUT SPEC [-o OUTPUT_BASE] [--rng-seed N]
@@ -1416,23 +1690,32 @@ Harmonize a directory of MSI datasets onto a shared m/z axis.
 ```
 dapple-cohort-align ROOT_DIR [-o OUTPUT_DIR]
                               [--pattern '*.imzML']
-                              [--recursive | --no-recursive]
+                              [--recursive]
                               [--bandwidth-ppm 50]
-                              [--min-prevalence 0.5]
+                              [--min-prevalence 0.05]
+                              [--pool-weighting {sample,intensity}]
+                              [--prevalence-basis {pixel,dataset}]
                               [--no-recalibrate]
-                              [--seed 0]
+                              [--rng-seed 0]
+                              [--no-imzml] [--no-tiff]
 ```
 
 - `ROOT_DIR` — directory containing `.imzML` files (or a custom `--pattern`).
 - `-o OUTPUT_DIR` — destination for per-dataset outputs and the cohort
-  summary. Default: `ROOT_DIR / "cohort_aligned"`.
+  summary. Default: `ROOT_DIR / "dapple_cohort"`.
+- `--pool-weighting sample` — default sample-balanced KDE discovery; choose
+  `intensity` only for raw pooled-intensity weighting.
+- `--prevalence-basis pixel|dataset` — denominator used by
+  `--min-prevalence`. Both prevalence vectors are still exported.
 
 Outputs:
 
-- `<stem>_cohort.imzML` + `.ibd` for each dataset
+- `<stem>_cohort.imzML` + `.ibd` + `.dapple-axis.json` for each dataset
 - `<stem>_cohort.tif` + `<stem>_cohort_channels.csv` for each dataset
-- `cohort_summary.json` — JSON manifest with the shared `mz_axis`,
-  per-dataset prevalence, cohort prevalence, and the run diagnostics.
+- `cohort_summary.json` — versioned JSON manifest with discovery settings,
+  input identities, `shared_consensus_mz`, pixel-weighted
+  `cohort_prevalence`, one-vote-per-sample `dataset_prevalence`, per-dataset
+  prevalence, selected filter, exact output artifact lists, parameters, and diagnostics.
 
 Exit codes: `0` success, `1` load/pipeline error, `2` argparse error.
 
@@ -1440,9 +1723,20 @@ Exit codes: `0` success, `1` load/pipeline error, `2` argparse error.
 
 ```json
 {
+  "summary_schema_version": 2,
   "n_datasets": 4,
+  "output_files": [
+    "run1_cohort.imzML", "run1_cohort.ibd",
+    "run1_cohort.dapple-axis.json", "cohort_summary.json", ...
+  ],
   "shared_consensus_mz": [200.01, 250.04, ...],
   "cohort_prevalence": [0.93, 0.81, ...],
+  "dataset_prevalence": [1.0, 0.75, ...],
+  "prevalence_filter": {
+    "basis": "dataset",
+    "minimum": 0.5,
+    "values": [1.0, 0.75, ...]
+  },
   "per_dataset_prevalence": {
     "0": [0.95, 0.85, ...],
     "1": [0.91, 0.78, ...]
@@ -1453,8 +1747,46 @@ Exit codes: `0` success, `1` load/pipeline error, `2` argparse error.
     "cohort_prevalence_median": 0.62
   },
   "datasets": [
-    {"input": "run1.imzML", "stem": "run1", "n_pixels": 4136},
+    {
+      "source_path": "cohort/run1.imzML",
+      "content_sha256": "...",
+      "output_basename": "run1_cohort",
+      "output_files": [
+        "run1_cohort.imzML", "run1_cohort.ibd", "run1_cohort.dapple-axis.json", ...
+      ],
+      "n_pixels": 4136
+    },
     ...
   ]
 }
 ```
+
+### `dapple-analyze-patterns`
+
+Analyze a harmonized imzML without opening napari. Channel intensities come
+from the `.imzML + .ibd + .dapple-axis.json` set; named ROI polygons come from
+a saved `.spec.xml`.
+
+```
+dapple-analyze-patterns roi INPUT
+  --roi-spec RUN.spec.xml
+  --numerator NAME [--numerator NAME ...]
+  --denominator NAME [--denominator NAME ...]
+  [--overlap-policy {error,exclude,first,allow}]
+  [-o OUTPUT_DIR] [--stem STEM]
+
+dapple-analyze-patterns axis INPUT
+  --start Y X --end Y X
+  [--axis-name NAME] [--start-label LABEL] [--end-label LABEL]
+  [--half-width PIXELS] [--bins N]
+  [--permutations N] [--seed N]
+  [--roi-spec RUN.spec.xml --roi-name NAME ...]
+  [-o OUTPUT_DIR] [--stem STEM]
+```
+
+`INPUT` must restore a harmonized `PeakMatrix`; a plain processed imzML is
+rejected. Axis coordinates are zero-based napari `Y X`. ROI mode writes one CSV
+and axis mode writes profile/statistics CSVs; both write a JSON manifest and
+print inference status and output paths. Additional flags expose the core API's
+minimum units/bins, trimming, pseudocount, label thresholds, and channel chunk
+size; use `dapple-analyze-patterns <mode> --help` for the exact current set.

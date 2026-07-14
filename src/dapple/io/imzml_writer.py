@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from textwrap import indent
 
 import numpy as np
 
+from dapple.data.coords import coords_to_grid_index, grid_index_to_coords
 from dapple.data.dataset import MSIDataset, PeakList, PeakMatrix
 
 
@@ -49,6 +51,21 @@ class ImzMLWriteResult:
     n_spectra: int
     total_peaks: int
     ibd_md5: str
+    axis_sidecar_path: Path | None = None
+
+    @property
+    def artifact_paths(self) -> tuple[Path, ...]:
+        """Every file required to preserve the written dataset's semantics.
+
+        Harmonized exports are a three-file set: imzML XML, binary ``.ibd``,
+        and the DAPPLE shared-axis sidecar. Keeping this list on the result
+        prevents callers from accidentally omitting the sidecar from output
+        counts, logs, and manifests.
+        """
+        paths = (self.imzml_path, self.ibd_path)
+        if self.axis_sidecar_path is not None:
+            paths += (self.axis_sidecar_path,)
+        return paths
 
 
 def write_imzml(
@@ -71,7 +88,10 @@ def write_imzml(
         imzml_path = base.with_suffix(".imzML")
         ibd_path = base.with_suffix(".ibd")
 
-    coords = ds.coords  # (n_pixels, 2) — (x, y)
+    # imzML positions are always one-based. Normalize either accepted internal
+    # representation through flat grid indices before serializing.
+    flat_coords = coords_to_grid_index(ds.coords, ds.grid_shape)
+    coords = grid_index_to_coords(flat_coords, ds.grid_shape) + 1
     n_pixels = coords.shape[0]
     is_harmonized = isinstance(ds.backend, PeakMatrix)
 
@@ -111,8 +131,9 @@ def write_imzml(
         fh.write(buf)
         h.update(buf)
 
+    ibd_uuid = uuid.uuid4()
     with ibd_path.open("wb") as f:
-        uuid_bytes = b"\x00" * 16
+        uuid_bytes = ibd_uuid.bytes
         _write(uuid_bytes, f)
         for mz_i, int_i in zip(pixel_mz, pixel_int, strict=True):
             offsets_mz.append(f.tell())
@@ -134,8 +155,19 @@ def write_imzml(
     )
     mode_ref = (
         '<cvParam accession="MS:1000127" cvRef="MS" name="centroid spectrum"/>'
-        if ds.metadata.profile_or_centroided == "centroided"
+        if is_harmonized or ds.metadata.profile_or_centroided == "centroided"
         else '<cvParam accession="MS:1000128" cvRef="MS" name="profile spectrum"/>'
+    )
+    nonempty_mz = [values for values in pixel_mz if values.size]
+    observed_min = (
+        min(float(values.min()) for values in nonempty_mz)
+        if nonempty_mz
+        else float(ds.metadata.mz_min)
+    )
+    observed_max = (
+        max(float(values.max()) for values in nonempty_mz)
+        if nonempty_mz
+        else float(ds.metadata.mz_max)
     )
 
     # Build the spectrum block list.
@@ -163,7 +195,7 @@ def write_imzml(
             f"        </binaryDataArray>"
         )
         spectrum_xml = (
-            f'      <spectrum id="spectrum={i}" index="{i}" defaultArrayLength="0">\n'
+            f'      <spectrum id="spectrum={i}" index="{i}" defaultArrayLength="{n_mz}">\n'
             f'        <referenceableParamGroupRef ref="spectrum"/>\n'
             f"        {polarity_cv}\n"
             f"        <scanList count=\"1\">\n"
@@ -199,10 +231,12 @@ def write_imzml(
   </cvList>
   <fileDescription>
     <fileContent>
-      <cvParam accession="IMS:1000080" cvRef="IMS" name="universally unique identifier" value="00000000-0000-0000-0000-000000000000"/>
+      <cvParam accession="IMS:1000080" cvRef="IMS" name="universally unique identifier" value="{ibd_uuid}"/>
       <cvParam accession="IMS:1000031" cvRef="IMS" name="processed"/>
       <cvParam accession="IMS:1000090" cvRef="IMS" name="ibd MD5" value="{ibd_md5}"/>
       <cvParam accession="MS:1000294" cvRef="MS" name="mass spectrum"/>
+      <cvParam accession="MS:1000528" cvRef="MS" name="lowest observed m/z" value="{observed_min:.12g}"/>
+      <cvParam accession="MS:1000527" cvRef="MS" name="highest observed m/z" value="{observed_max:.12g}"/>
     </fileContent>
   </fileDescription>
   <referenceableParamGroupList count="3">
@@ -244,6 +278,7 @@ def write_imzml(
     # If we wrote a PeakMatrix-backed dataset, drop a sidecar so the reader can
     # reconstruct the dense matrix on load. The marker user-param in the XML is
     # the primary signal; this sidecar carries the data needed to rebuild.
+    sidecar_path: Path | None = None
     if is_harmonized:
         pm: PeakMatrix = ds.backend  # type: ignore[assignment]
         prev = ds.extra.get("consensus_prevalence")
@@ -267,6 +302,7 @@ def write_imzml(
         n_spectra=n_pixels,
         total_peaks=int(sum(lengths_mz)),
         ibd_md5=ibd_md5,
+        axis_sidecar_path=sidecar_path,
     )
 
 

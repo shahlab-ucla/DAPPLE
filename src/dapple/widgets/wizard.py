@@ -66,7 +66,7 @@ from dapple.viz.projections import (
     percentile_contrast,
     projection_layer_name,
 )
-from dapple.widgets._session import MsiSession, default_session
+from dapple.widgets._session import MsiSession, adopt_dataset_from_viewer, default_session
 from dapple.widgets.preview import PreviewWidget
 from dapple.widgets.roi import RoiWidget
 
@@ -120,6 +120,25 @@ class LoadPage(_BasePage):
         layout.addStretch(1)
 
         self._loaded = False
+
+    def initializePage(self) -> None:
+        """Adopt a dataset opened through napari's reader before the wizard."""
+        if self._loaded:
+            return
+        ds = self._wizard_ref.session.dataset
+        if ds is None:
+            return
+        source = Path(ds.identity.source_path)
+        self._path_edit.setText(str(source))
+        self._info.setText(
+            f"using active dataset {source.name}: {ds.n_pixels} pixels, "
+            f"grid {ds.grid_shape}, {ds.metadata.instrument_family}/"
+            f"{ds.metadata.profile_or_centroided}"
+        )
+        self._wizard_ref.set_input_snapshot(ds)
+        self._loaded = True
+        self.completeChanged.emit()
+        self.file_loaded.emit(ds)
 
     def _on_browse_file(self) -> None:
         p, _ = QFileDialog.getOpenFileName(
@@ -273,12 +292,19 @@ class ParamsPage(_BasePage):
         self._pixel_size.setSpecialValueText("(unset)")
         _add_row("pixel_size_um", "Pixel size (µm)", self._pixel_size)
 
-        # `sample_type` is intentionally not exposed in the wizard UI today: no
-        # current operator consumes it. Future spatial-filter operators (e.g. Moran's
-        # I with permutation null) are expected to switch their ON/OFF default based
-        # on it; until then we keep the field on the data model (so JSON sidecars and
-        # .spec.xml files can still set it) but don't ask the user to fill in
-        # something that doesn't yet do anything.
+        self._sample_type = QComboBox()
+        self._sample_type.addItems(
+            ["(unspecified)", "tissue", "cell_culture", "whole_organism", "other"]
+        )
+        self._sample_type.setToolTip(
+            "Controls spatially aware workflow recommendations. Tissue samples "
+            "enable the Moran's I permutation filter by default."
+        )
+        _add_row("sample_type", "Sample type", self._sample_type)
+
+        self._notes = QLineEdit()
+        self._notes.setPlaceholderText("Optional acquisition or biological context")
+        _add_row("notes", "Notes", self._notes)
 
         controls = QHBoxLayout()
         controls.addStretch(1)
@@ -296,6 +322,8 @@ class ParamsPage(_BasePage):
             widget.currentTextChanged.connect(lambda _v, f=fname: self._on_user_edit(f))
         elif isinstance(widget, QDoubleSpinBox):
             widget.valueChanged.connect(lambda _v, f=fname: self._on_user_edit(f))
+        elif isinstance(widget, QLineEdit):
+            widget.textChanged.connect(lambda _v, f=fname: self._on_user_edit(f))
 
     def _on_user_edit(self, fname: str) -> None:
         # Only flip to "user override" if the new value differs from the detected one.
@@ -344,6 +372,8 @@ class ParamsPage(_BasePage):
             self._write_value("mz_min", float(ep.mz_min))
             self._write_value("mz_max", float(ep.mz_max))
             self._write_value("pixel_size_um", float(ep.pixel_size_um or 0))
+            self._write_value("sample_type", ep.sample_type)
+            self._write_value("notes", ep.notes)
         finally:
             for w in self._inputs.values():
                 w.blockSignals(False)
@@ -369,7 +399,8 @@ class ParamsPage(_BasePage):
                 mz_min=float(self._mz_min.value()),
                 mz_max=float(self._mz_max.value()),
                 pixel_size_um=(float(self._pixel_size.value()) if self._pixel_size.value() > 0 else None),
-                sample_type=ds.metadata.sample_type,  # carried through unchanged
+                sample_type=self._read_value("sample_type"),  # type: ignore[arg-type]
+                notes=str(self._read_value("notes") or ""),
             )
         except ValueError as e:
             QMessageBox.warning(self, "Invalid parameters", str(e))
@@ -406,20 +437,30 @@ class ParamsPage(_BasePage):
     def _read_value(self, fname: str) -> object:
         widget = self._inputs[fname]
         if isinstance(widget, QComboBox):
-            return widget.currentText()
+            value = widget.currentText()
+            if fname == "sample_type" and value == "(unspecified)":
+                return None
+            return value
         if isinstance(widget, QDoubleSpinBox):
             return float(widget.value())
+        if isinstance(widget, QLineEdit):
+            return widget.text()
         return None
 
     def _write_value(self, fname: str, value: object) -> None:
         widget = self._inputs[fname]
         if isinstance(widget, QComboBox):
-            widget.setCurrentText(str(value))
+            if fname == "sample_type" and value is None:
+                widget.setCurrentText("(unspecified)")
+            else:
+                widget.setCurrentText(str(value))
         elif isinstance(widget, QDoubleSpinBox):
             try:
                 widget.setValue(float(value))  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 pass
+        elif isinstance(widget, QLineEdit):
+            widget.setText(str(value or ""))
 
 
 class PreviewPage(_BasePage):
@@ -549,8 +590,9 @@ class WorkflowPage(_BasePage):
         self._summary.setText(
             f"{len(pipeline.nodes)} operators in the recommended chain. "
             f"Hover any field for guidance on when and how to adjust it. "
-            f"Optional cleanup operators (hot-pixel filter, prevalence FDR "
-            f"filter, background subtract) are listed around the chain — "
+            f"Optional cleanup operators (hot-pixel filter, experimental "
+            f"prevalence sensitivity filter, background subtract) are listed "
+            f"around the chain — "
             f"enable them with the checkbox on each card."
         )
         # Insert cards before the trailing stretch. If we have a previous run's
@@ -591,17 +633,16 @@ class WorkflowPage(_BasePage):
             self._cards.append(card)
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, card)
 
-        # 3. Optional permutation-null prevalence FDR filter — placed after the
-        # recommended chain so it operates on the final PeakMatrix. Acts as an
-        # empirical replacement for the conservative ``min_prevalence`` floor
-        # used by the consensus operator: drops channels whose prevalence is
-        # indistinguishable from random peak placement.
+        # 3. Optional occupancy-based prevalence sensitivity filter, placed
+        # after the recommended chain so it operates on the final PeakMatrix.
+        # The null is not calibrated after consensus selection, so this remains
+        # disabled by default and is presented only as a sensitivity analysis.
         self._add_optional_card(
             ds.metadata, op_name="prevalence_fdr_filter", node_id="prev_fdr",
             optional_hint=(
-                "Drops consensus channels whose prevalence is indistinguishable "
-                "from random peak placement. Empirical alternative to the "
-                "fixed-floor 'min_prevalence' on the consensus card."
+                "Experimental sensitivity analysis only. Its with-replacement "
+                "occupancy scores can be anti-conservative after consensus "
+                "selection and are not a replacement for fixed min_prevalence."
             ),
         )
 
@@ -631,7 +672,7 @@ class WorkflowPage(_BasePage):
         node = Node(
             id=node_id,
             op_name=op_name,
-            params=op.default_params(ep),
+            params=self._optional_default_params(op_name, op.default_params(ep)),
             upstream=(),
         )
         warns = self._operator_warnings(node, ep)
@@ -650,6 +691,19 @@ class WorkflowPage(_BasePage):
         )
         self._cards.append(card)
         self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, card)
+
+    def _optional_default_params(self, op_name: str, params: OpParams) -> OpParams:
+        """Apply wizard-page choices to an optional operator's initial params."""
+        if op_name != "background_subtract":
+            return params
+        for page_id in self._wizard_ref.pageIds():
+            page = self._wizard_ref.page(page_id)
+            if isinstance(page, RoiPage):
+                return dataclass_replace(
+                    params,
+                    use_outside_as_bg=page._roi.background_outside,  # noqa: SLF001
+                )
+        return params
 
     def _on_reset_defaults(self) -> None:
         self._wizard_ref._proposed_pipeline = None  # noqa: SLF001 — force rebuild
@@ -1012,10 +1066,12 @@ class RunPage(_BasePage):
         )
         if not path:
             return
+        input_ds = self._wizard_ref._input_dataset_snapshot or ds  # noqa: SLF001
         prov = make_provenance(
             plugin_version=_plugin_version(),
-            input_dataset_hash=ds.hash(),
-            declared_md5=ds.identity.declared_md5,
+            input_dataset_hash=input_ds.hash(),
+            declared_md5=input_ds.identity.declared_md5,
+            roi_definitions=input_ds.rois,
         )
         write_spec_xml(
             path,
@@ -1035,8 +1091,9 @@ class RunPage(_BasePage):
         if not path:
             return
         result = write_imzml(self._run_result.output, path)
+        companions = [artifact.name for artifact in result.artifact_paths[1:]]
         self._log.append(
-            f"wrote {result.imzml_path} (+ {result.ibd_path}); "
+            f"wrote {result.imzml_path} (+ {', '.join(companions)}); "
             f"{result.n_spectra} spectra / {result.total_peaks} peaks"
         )
 
@@ -1080,7 +1137,7 @@ _OP_DISPLAY_NAMES: dict[str, str] = {
     "morans_i_permutation": "7. Spatial filter (Moran's I)",
     "background_subtract": "(optional) Background subtraction",
     "hot_pixel_filter": "(optional) Hot-pixel correction",
-    "prevalence_fdr_filter": "(optional) Prevalence FDR filter",
+    "prevalence_fdr_filter": "(experimental) Prevalence sensitivity filter",
 }
 
 
@@ -1236,25 +1293,18 @@ _PLOT_TOOLTIPS: dict[str, str] = {
         "</ul>"
     ),
     "histogram:prevalence_fdr_q_values": (
-        "<b>Prevalence FDR — distribution of BH-adjusted q-values</b>"
-        "<p>Each consensus channel's q-value for the test "
-        "<em>is this channel's prevalence higher than random?</em>. The null "
-        "places k_c peaks uniformly across n_pixels bins (occupancy problem); "
-        "small q means the observed prevalence is far above what random "
-        "placement would produce.</p>"
-        "<p><b>Look for:</b></p>"
-        "<ul>"
-        "<li><b>Most channels at q ≈ 0</b> — every channel is clearly "
-        "non-random. Healthy on a well-segmented image.</li>"
-        "<li><b>Bimodal — one mode near 0, another near 1</b> — the filter is "
-        "doing meaningful work, cleanly separating signal from noise.</li>"
-        "<li><b>Uniform distribution on [0, 1]</b> — no channel is "
-        "distinguishable from noise. Upstream peak picking may be too "
-        "permissive; tighten ``snr_mad`` or raise ``min_prominence_quantile``.</li>"
-        "<li><b>Most channels above q_threshold</b> — the test is too strict "
-        "for this data. Raise q_threshold, or accept that this image lacks "
-        "spatially-coherent channels.</li>"
-        "</ul>"
+        "<b>Experimental prevalence occupancy scores</b>"
+        "<p>The plot shows BH-adjusted scores from a with-replacement occupancy "
+        "model. Smaller values mean prevalence exceeded that model's simulated "
+        "occupancy.</p>"
+        "<p><b>Important:</b> these are sensitivity scores, not calibrated "
+        "confirmatory q-values. Peak picking and consensus assignment constrain "
+        "the observed occupancy and can make values anti-conservative. Compare "
+        "multiple cutoffs and prefer fixed min_prevalence or cohort-level "
+        "dataset prevalence for production decisions.</p>"
+        "<p><b>Look for:</b> stability of retained channels across several "
+        "declared cutoffs. A result that changes sharply with the cutoff is "
+        "threshold-sensitive and should remain exploratory.</p>"
     ),
     "scatter:reference_mz_vs_prevalence": (
         "<b>Reference ions: m/z vs. pixel prevalence</b>"
@@ -1853,6 +1903,10 @@ class WizardWidget(QWizard):
         # user can see which parameters dropped the most candidates last time.
         self._last_run_result = None  # type: ignore[assignment]
 
+        # A dataset opened by napari's reader already lives on a layer.  Adopt it so
+        # the documented drop-and-go flow does not require loading the same file twice.
+        adopt_dataset_from_viewer(self._session, napari_viewer)
+
         # When the session's ROIs change (RoiWidget edits), the dataset gets a new
         # `rois` tuple but its identity is unchanged. Capture the rois-updated dataset
         # as the new pipeline input.
@@ -1875,6 +1929,8 @@ class WizardWidget(QWizard):
         self.addPage(WorkflowPage(self))
         self.addPage(ReviewPage(self))
         self.addPage(RunPage(self))
+        if self._session.dataset is not None:
+            self.set_input_snapshot(self._session.dataset)
 
     @property
     def viewer(self) -> "napari.Viewer | None":

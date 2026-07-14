@@ -74,6 +74,10 @@ def test_morans_i_keeps_strongly_clustered_channel():
     assert kept[0]
     # The output's mz_axis should reflect surviving channels.
     assert result.dataset.backend.n_peaks == int(kept.sum())
+    n_out = result.dataset.backend.n_peaks
+    assert len(result.dataset.extra["morans_i_per_channel"]) == n_out
+    assert len(result.dataset.extra["morans_i_p_values"]) == n_out
+    assert len(result.dataset.extra["morans_i_q_values"]) == n_out
 
 
 def test_morans_i_drops_most_pure_noise_channels():
@@ -134,6 +138,23 @@ def test_morans_i_rook_neighborhood_smaller_than_queen():
     rook_S0 = rook_result.diagnostics[0].summary["S0"]
     # Queen neighborhood has more edges than rook, so S0 is larger.
     assert queen_S0 > rook_S0
+
+
+def test_default_positive_tail_rejects_checkerboard_dispersion():
+    h = w = 16
+    yy, xx = np.indices((h, w))
+    checkerboard = ((xx + yy) % 2).reshape(-1).astype(np.float32)
+    clustered = (xx < w // 2).reshape(-1).astype(np.float32)
+    ds = _make_grid_dataset(np.column_stack([checkerboard, clustered]), h, w)
+    result = MoransIPermutation().apply(
+        ds,
+        MoransIParams(n_permutations=199, q_threshold=0.05),
+        rng=np.random.default_rng(0),
+    )
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.payload["I_obs"][0] < 0
+    assert not diagnostic.payload["kept_mask"][0]
+    assert diagnostic.payload["kept_mask"][1]
 
 
 def test_bh_fdr_monotone_and_bounded():

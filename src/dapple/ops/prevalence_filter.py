@@ -1,58 +1,36 @@
-"""Permutation-null FDR test for the prevalence filter.
+"""Experimental occupancy sensitivity filter for consensus prevalence.
 
-The single-dataset consensus operators (``kde_consensus_alignment``,
-``dbscan_consensus``) ship with a conservative ``min_prevalence`` floor —
-channels whose fraction of non-zero pixels is below the floor are dropped
-without further test. This module replaces that thresholding with an
-**empirical permutation-null test** for "is this channel's prevalence higher
-than would be expected if peaks were randomly distributed across pixels?".
+This operator simulates the occupancy distribution obtained by placing a
+channel's ``k_c`` assigned peaks independently and uniformly across pixels,
+then applies a right-tail Monte-Carlo test and Benjamini-Hochberg adjustment.
+It is retained for exploratory sensitivity analysis and is disabled by
+default.
 
-Why permutation null
---------------------
+Important statistical limitation
+--------------------------------
 
-The natural one-sample null for a channel's prevalence is the **occupancy
-problem**: given ``k_c`` peaks placed independently and uniformly across
-``n_pixels`` pixels, what's the distribution of "number of distinct pixels
-hit"? An exact closed form exists (a Stirling-numbers identity) but is
-numerically unstable for the (k_c, n_pixels) regime we care about. A
-Monte-Carlo permutation gives the same answer with arbitrary precision in O(B
-* k_c) per channel — usually milliseconds for sane parameters.
+This is *not* a calibrated inferential replacement for ``min_prevalence``.
+Consensus construction and peak picking constrain the assignments used to
+define a channel. In the common case where a channel has at most one assigned
+peak per carrier pixel, ``k_c`` is equal (or close) to the number of occupied
+pixels. The with-replacement occupancy null allows collisions, so the observed
+collision-free assignments can appear spuriously significant even when the
+set of carrier pixels is random. Selection of the channel on the same data
+introduces an additional post-selection bias.
 
-For each channel ``c``:
+For each channel ``c`` the implementation:
 
-1. Pull its observed prevalence ``p_obs(c) = (matrix[:, c] > 0).sum() / n_pixels``.
-2. Pull its observed peak count ``k_c`` from ``ds.extra["consensus_n_peaks_per_channel"]``
-   (recorded by the consensus operator upstream).
-3. Simulate B permutations: place ``k_c`` peaks into ``n_pixels`` bins uniformly
-   at random; count distinct bins; convert to prevalence ``p_perm``.
-4. Empirical right-tail p-value with the +1/+1 stabilizer:
-   ``p_value(c) = (#{p_perm >= p_obs} + 1) / (B + 1)``.
-5. Benjamini–Hochberg adjustment across all channels.
-6. Drop channels with ``q_value >= q_threshold``.
+1. measures ``p_obs(c) = (matrix[:, c] > 0).sum() / n_pixels``;
+2. reads ``k_c`` from ``consensus_n_peaks_per_channel``;
+3. simulates B with-replacement placements of those peaks across pixels;
+4. computes a stabilized empirical right-tail p-value; and
+5. applies Benjamini-Hochberg adjustment across channels.
 
-This is the empirical analog of "channel c is real if its peaks are more
-broadly shared across the image than random placement would produce".
-
-When to use
------------
-
-- After consensus alignment, on any PeakMatrix-backed dataset.
-- Particularly useful when ``min_prevalence`` is hard to set: the FDR test
-  adapts to ``k_c`` per channel, so a channel with many peaks needs higher
-  prevalence to look "non-random" than one with few peaks. The same fixed
-  ``min_prevalence`` over-rejects sparse channels and under-rejects dense
-  ones.
-
-Caveats
--------
-
-- The null assumes peaks are placed independently across pixels. If your
-  pipeline already drops noise channels via Moran's I, run that *after* this
-  filter, not before — Moran's I needs spatially structured channels to
-  detect, and this filter removes the spatially-unstructured ones first.
-- For very small datasets (n_pixels < ~64) the null distribution is too
-  coarse to discriminate; the operator falls through as a passthrough in that
-  regime (same convention as ``morans_i_permutation``).
+Use a declared ``min_prevalence`` threshold for single-image filtering, and
+dataset-level prevalence in cohort harmonization for cross-sample evidence.
+If this operator is enabled, treat its q-values only as sensitivity scores,
+report that choice, and verify conclusions across multiple thresholds. For
+very small datasets the operator passes through without filtering.
 """
 
 from __future__ import annotations
@@ -61,7 +39,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from dapple.data.dataset import MSIDataset, PeakMatrix
+from dapple.data.dataset import (
+    MSIDataset,
+    PeakMatrix,
+    subset_channel_aligned_extra,
+)
 from dapple.data.metadata import ExperimentParams
 from dapple.ops.base import (
     Diagnostic,
@@ -82,11 +64,9 @@ class PrevalenceFdrParams(OpParams):
             "label": "Permutation count",
             "help": (
                 "Number of Monte-Carlo permutations used to estimate the null "
-                "occupancy distribution per channel. Default 499 gives p-value "
-                "resolution of ~0.002 — comfortable for a BH-FDR cut across a "
-                "few hundred channels. Drop to 99 for fast iteration; raise to "
-                "1999 if the channel count exceeds ~1000 and you need tighter "
-                "p-values."
+                "occupancy sensitivity distribution per channel. Default 499 "
+                "gives score resolution of ~0.002. These scores are not "
+                "calibrated inferential p-values; see the operator warning."
             ),
         },
     )
@@ -96,10 +76,9 @@ class PrevalenceFdrParams(OpParams):
             "label": "BH-FDR q threshold",
             "help": (
                 "Channels with Benjamini-Hochberg-adjusted q-value above this "
-                "threshold are dropped. Default 0.05 (the standard FDR floor). "
-                "Raise to 0.1 to be permissive; lower to 0.01 to keep only "
-                "channels whose prevalence is strongly above the random-placement "
-                "expectation."
+                "sensitivity cutoff are dropped. The conventional 0.05 default "
+                "does not make this occupancy model a calibrated hypothesis "
+                "test. Prefer fixed min_prevalence for production workflows."
             ),
         },
     )
@@ -125,10 +104,18 @@ class PrevalenceFdrParams(OpParams):
         },
     )
 
+    def __post_init__(self) -> None:
+        if self.n_permutations < 1:
+            raise ValueError("n_permutations must be at least 1")
+        if not 0 < self.q_threshold <= 1:
+            raise ValueError("q_threshold must be in (0, 1]")
+        if self.min_pixels_for_test < 1:
+            raise ValueError("min_pixels_for_test must be at least 1")
+
 
 @register
 class PrevalenceFdrFilter(Operator):
-    """Drop consensus channels whose prevalence is indistinguishable from random."""
+    """Experimental occupancy-based prevalence sensitivity filter."""
 
     name = "prevalence_fdr_filter"
     params_cls = PrevalenceFdrParams
@@ -137,7 +124,13 @@ class PrevalenceFdrFilter(Operator):
         return PrevalenceFdrParams()
 
     def validate(self, ep: ExperimentParams) -> list[str]:
-        return []
+        return [
+            "Experimental only: the with-replacement occupancy null is not "
+            "calibrated after peak picking and consensus assignment and can be "
+            "anti-conservative. Prefer a declared min_prevalence threshold or "
+            "cohort dataset prevalence; interpret q-values as sensitivity "
+            "scores, not confirmatory FDR."
+        ]
 
     def apply(
         self,
@@ -165,37 +158,34 @@ class PrevalenceFdrFilter(Operator):
         if n_channels == 0:
             return _passthrough(ds, params, self.name, "no channels to test")
 
-        # Observed prevalence per channel.
-        p_obs = (matrix > 0).sum(axis=0).astype(np.float64) / max(n_pixels, 1)
+        # Preserve integer carrier counts for the Monte-Carlo comparison.
+        observed_carriers = (matrix > 0).sum(axis=0).astype(np.int64)
+        p_obs = observed_carriers.astype(np.float64) / max(n_pixels, 1)
 
         # Per-channel total peak count (the null's ball count). Recorded by the
-        # consensus operator upstream. If it's missing (e.g. legacy dataset),
-        # fall back to using the observed pixel count — yields a conservative
-        # test (the null with k_c = pixel-count produces approximately the same
-        # prevalence as observed, so p-values will be conservatively near 0.5).
+        # consensus operator upstream. If it is missing (for example in a
+        # legacy dataset), fall back to the observed carrier count. This keeps
+        # the exploratory operator runnable but does not restore calibration.
         k_per = ds.extra.get("consensus_n_peaks_per_channel")
         if k_per is None or len(k_per) != n_channels:
-            k_per = np.maximum(
-                (matrix > 0).sum(axis=0).astype(np.int64), 1
-            )
+            k_per = np.maximum(observed_carriers, 1)
             note = (
                 "consensus_n_peaks_per_channel missing — falling back to "
-                "observed pixel count; test is conservative."
+                "observed carrier count; occupancy scores remain uncalibrated."
             )
         else:
             k_per = np.asarray(k_per, dtype=np.int64)
             note = ""
 
-        # Permutation null. For each channel c we sample B occupancy values
-        # from the discrete distribution "k_c balls in n_pixels bins, count
-        # distinct bins". Vectorized per channel: allocate a (B, n_pixels)
-        # presence bool, scatter sampled pixel indices, sum along axis 1.
+        # Permutation null. Count distinct sorted draws rather than allocating
+        # a dense (B, n_pixels) presence matrix. This keeps memory proportional
+        # to sampled peaks instead of image size for sparse MSI images.
         B = int(params.n_permutations)
         seed = int(rng.integers(0, 2**31 - 1)) ^ int(params.rng_seed)
         prng = np.random.default_rng(seed)
         n_extreme = np.zeros(n_channels, dtype=np.int64)
-        # For each channel, count how many of B perm samples produce a
-        # prevalence >= the observed one.
+        # For each channel, count how many samples have occupancy at least as
+        # large as the observed carrier count.
         for c in range(n_channels):
             k = int(k_per[c])
             if k <= 0:
@@ -203,26 +193,42 @@ class PrevalenceFdrFilter(Operator):
                 # prevalence is also 0. p-value = 1 (always extreme).
                 n_extreme[c] = B
                 continue
-            # Sample (B, k) uniform pixel indices; mark presence; count distinct.
-            # Memory-bounded chunking when B*k would exceed ~50M (e.g. very
-            # peaky channels): split B into chunks.
-            chunk = max(1, min(B, max(1, 50_000_000 // max(k, 1))))
-            distinct = np.empty(B, dtype=np.int64)
+            # Sample uniform pixel indices in memory-bounded replicate chunks.
+            if k == 1:
+                n_extreme[c] = B if observed_carriers[c] <= 1 else 0
+                continue
+
+            # Sorting needs one integer draw array and one adjacent-difference
+            # boolean array. Keep their combined working set near 32 MiB. A
+            # single replicate may exceed that target when k itself is huge,
+            # but memory no longer scales with the image's pixel count.
+            draw_dtype = (
+                np.int32 if n_pixels <= np.iinfo(np.int32).max else np.int64
+            )
+            bytes_per_draw = (
+                np.dtype(draw_dtype).itemsize + np.dtype(bool).itemsize
+            )
+            target_bytes = 32 * 1024 * 1024
+            chunk = max(
+                1,
+                min(B, target_bytes // max(k * bytes_per_draw, 1)),
+            )
             done = 0
+            extreme = 0
             while done < B:
                 b = min(chunk, B - done)
-                pixels = prng.integers(0, n_pixels, size=(b, k), dtype=np.int64)
-                # presence[row, pixel] = True; sum gives distinct pixel count per row.
-                presence = np.zeros((b, n_pixels), dtype=bool)
-                row_idx = np.repeat(np.arange(b), k)
-                # Using boolean OR semantics via direct assignment is fine since
-                # we only care about the True state — duplicate assignments are
-                # idempotent.
-                presence[row_idx, pixels.ravel()] = True
-                distinct[done:done + b] = presence.sum(axis=1)
+                pixels = prng.integers(
+                    0, n_pixels, size=(b, k), dtype=draw_dtype
+                )
+                pixels.sort(axis=1)
+                distinct = 1 + np.count_nonzero(
+                    pixels[:, 1:] != pixels[:, :-1], axis=1
+                )
+                extreme += int(
+                    np.count_nonzero(distinct >= observed_carriers[c])
+                )
                 done += b
-            p_perm = distinct.astype(np.float64) / max(n_pixels, 1)
-            n_extreme[c] = int(np.sum(p_perm >= p_obs[c]))
+            n_extreme[c] = extreme
 
         # Empirical right-tail p-value with the +1/+1 stabilizer (so p_value
         # is never exactly 0, which would crash BH-FDR's downstream log).
@@ -232,9 +238,9 @@ class PrevalenceFdrFilter(Operator):
         if not keep.any():
             raise RuntimeError(
                 f"prevalence_fdr_filter: every channel rejected at q < "
-                f"{params.q_threshold}. The dataset has no channels with "
-                "prevalence significantly above random; consider lowering "
-                "q_threshold or revisiting upstream peak picking / consensus."
+                f"{params.q_threshold}. No channel passed this experimental "
+                "sensitivity cutoff; use the declared min_prevalence result or "
+                "raise the cutoff for sensitivity comparison."
             )
 
         # Trim the matrix to surviving channels.
@@ -242,17 +248,19 @@ class PrevalenceFdrFilter(Operator):
         new_axis = np.asarray(pm.mz_axis[:])[keep].astype(np.float64, copy=False)
         new_pm = PeakMatrix(matrix=new_matrix, mz_axis=new_axis)
 
-        # Subset companion arrays in extra to match.
-        new_extra = {**ds.extra}
-        for key in ("consensus_prevalence", "consensus_n_peaks_per_channel"):
-            v = new_extra.get(key)
-            if v is not None and len(v) == n_channels:
-                new_extra[key] = np.asarray(v)[keep]
+        # Subset every known channel-aligned companion array to match.
+        new_extra = subset_channel_aligned_extra(
+            ds.extra,
+            keep,
+            n_channels,
+            replacements={
+                "prevalence_fdr_p_values": p_values[keep],
+                "prevalence_fdr_q_values": q_values[keep],
+            },
+        )
         new_extra["prevalence_fdr_dropped_n"] = int((~keep).sum())
-        new_extra["prevalence_fdr_p_values"] = p_values
-        new_extra["prevalence_fdr_q_values"] = q_values
 
-        new_ds = ds.with_backend(new_pm).__class__(
+        new_ds = ds.__class__(
             coords=ds.coords,
             grid_shape=ds.grid_shape,
             metadata=ds.metadata,
@@ -274,6 +282,7 @@ class PrevalenceFdrFilter(Operator):
             "p_value_median": float(np.median(p_values)),
             "q_value_min": float(q_values.min()),
             "q_value_median": float(np.median(q_values)),
+            "warning_uncalibrated_occupancy_null": 1.0,
         }
         if note:
             summary["warning_conservative_fallback"] = 1.0
@@ -287,6 +296,13 @@ class PrevalenceFdrFilter(Operator):
                 "channel_mz_in": np.asarray(pm.mz_axis[:]),
                 "k_per_channel": k_per.astype(np.int64, copy=False),
                 "p_obs": p_obs,
+                "model_note": np.array(
+                    [
+                        "Experimental sensitivity score: the with-replacement "
+                        "occupancy null is not calibrated after channel selection."
+                    ],
+                    dtype=object,
+                ),
                 **({"note": np.array([note], dtype=object)} if note else {}),
             },
             figure_hint="histogram:prevalence_fdr_q_values",
@@ -318,8 +334,18 @@ def _passthrough(
             "n_dropped_by_fdr": 0.0,
             "n_permutations": float(params.n_permutations),
             "q_threshold": float(params.q_threshold),
+            "warning_uncalibrated_occupancy_null": 1.0,
         },
-        payload={"note": np.array([note], dtype=object)},
+        payload={
+            "note": np.array([note], dtype=object),
+            "model_note": np.array(
+                [
+                    "Experimental sensitivity score: the with-replacement "
+                    "occupancy null is not calibrated after channel selection."
+                ],
+                dtype=object,
+            ),
+        },
     )
     record = merge_op_record(
         op_name=op_name, params=params, input_ds=ds, output_ds=ds, diagnostics=[diag]

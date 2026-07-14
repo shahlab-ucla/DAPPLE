@@ -11,7 +11,7 @@ runner itself depending on Qt.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 import numpy as np
@@ -65,6 +65,11 @@ class PipelineRunner:
             cache_key = _cache_key(node, pipeline, input_for_node)
             if cache_key in self._cache:
                 out_ds = self._cache[cache_key]
+                # ROI-independent nodes intentionally omit ROI geometry from their
+                # cache key.  Rebind the current annotations onto a cached numerical
+                # result so a downstream ROI-dependent node sees the latest polygons.
+                if out_ds.rois != input_for_node.rois:
+                    out_ds = replace(out_ds, rois=input_for_node.rois)
                 node_diags = self._diag_cache.get(cache_key, [])
             else:
                 op_cls = REGISTRY.get(node.op_name)
@@ -72,8 +77,14 @@ class PipelineRunner:
                 # Per-node RNG: deterministic combination of master seed and node id.
                 rng = np.random.default_rng(_derive_seed(pipeline.rng_seed, node.id))
                 result = op.apply(input_for_node, node.params, rng=rng)
-                out_ds = result.dataset
+                out_ds = _stamp_runner_record(
+                    result.dataset,
+                    node=node,
+                    input_ds=input_for_node,
+                    cache_key=cache_key,
+                )
                 node_diags = list(result.diagnostics)
+                result = OpResult(dataset=out_ds, diagnostics=node_diags)
                 self._cache[cache_key] = out_ds
                 self._diag_cache[cache_key] = node_diags
                 if on_node_done is not None:
@@ -115,9 +126,39 @@ def _derive_seed(master_seed: int, node_id: str) -> int:
 
 
 def _cache_key(node: Node, pipeline: Pipeline, input_ds: MSIDataset) -> str:
+    op_cls = REGISTRY.get(node.op_name)
     return combine_hashes(
         node.op_name,
+        node.id,
         node.params_hash(),
-        input_ds.hash(),
+        str(pipeline.rng_seed),
+        input_ds.hash(include_rois=op_cls.depends_on_rois),
         hash_obj(pipeline.library_versions),
     )
+
+
+def _stamp_runner_record(
+    output_ds: MSIDataset,
+    *,
+    node: Node,
+    input_ds: MSIDataset,
+    cache_key: str,
+) -> MSIDataset:
+    """Make pipeline provenance reflect node identity, RNG seed, and libraries.
+
+    Operators can also be called directly, so their local record only knows the
+    operation, parameters, and input.  The runner owns the remaining reproducibility
+    context.  Replacing the just-appended record here prevents two runs with different
+    seeds (or the same operator at differently named nodes) from producing the same
+    output fingerprint.
+    """
+    if not output_ds.history or output_ds.history[-1].op_name != node.op_name:
+        return output_ds
+    op_cls = REGISTRY.get(node.op_name)
+    input_hash = input_ds.hash(include_rois=op_cls.depends_on_rois)
+    record = replace(
+        output_ds.history[-1],
+        input_hash=input_hash,
+        output_hash=cache_key,
+    )
+    return replace(output_ds, history=(*output_ds.history[:-1], record))

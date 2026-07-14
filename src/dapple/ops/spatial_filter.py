@@ -28,7 +28,7 @@ from typing import Literal
 import numpy as np
 
 from dapple.data.coords import coords_to_grid_index
-from dapple.data.dataset import MSIDataset, PeakMatrix
+from dapple.data.dataset import MSIDataset, PeakMatrix, subset_channel_aligned_extra
 from dapple.data.metadata import ExperimentParams
 from dapple.ops.base import (
     Diagnostic,
@@ -40,6 +40,7 @@ from dapple.ops.base import (
 )
 
 Neighborhood = Literal["queen", "rook"]
+MoranTail = Literal["positive", "two-sided"]
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,17 @@ class MoransIParams(OpParams):
             ),
         },
     )
+    tail: MoranTail = field(
+        default="positive",
+        metadata={
+            "label": "Spatial alternative",
+            "help": (
+                "positive keeps channels with clustered/coherent signal, the "
+                "intended noise-filter use. two-sided also treats strong negative "
+                "autocorrelation (for example checkerboards) as a pattern."
+            ),
+        },
+    )
     min_pixels_for_test: int = field(
         default=64,
         metadata={
@@ -103,6 +115,18 @@ class MoransIParams(OpParams):
             ),
         },
     )
+
+    def __post_init__(self) -> None:
+        if self.n_permutations < 1:
+            raise ValueError("n_permutations must be at least 1")
+        if not 0 < self.q_threshold <= 1:
+            raise ValueError("q_threshold must be in (0, 1]")
+        if self.neighborhood not in {"queen", "rook"}:
+            raise ValueError("neighborhood must be 'queen' or 'rook'")
+        if self.tail not in {"positive", "two-sided"}:
+            raise ValueError("tail must be 'positive' or 'two-sided'")
+        if self.min_pixels_for_test < 1:
+            raise ValueError("min_pixels_for_test must be at least 1")
 
 
 @register
@@ -163,8 +187,10 @@ class MoransIPermutation(Operator):
         B = int(params.n_permutations)
         seed = int(rng.integers(0, 2**31 - 1)) ^ int(params.rng_seed)
         prng = np.random.default_rng(seed)
-        # Tail counts for the empirical p-value: number of permutations whose
-        # |I_perm[c]| >= |I_obs[c]| (two-sided test).
+        # Tail counts for the empirical p-value. Positive is the default because
+        # this operator promises spatial coherence; a strong checkerboard has
+        # negative I and should not survive unless the user explicitly asks for
+        # any (two-sided) spatial pattern.
         n_extreme = np.zeros(n_channels, dtype=np.int64)
         # We'll need x's variance per channel under permutation — but variance is
         # invariant to row permutation, so denominator stays constant.
@@ -176,7 +202,10 @@ class MoransIPermutation(Operator):
             with np.errstate(invalid="ignore", divide="ignore"):
                 I_perm = (n_pixels / S0) * num_p / np.where(denominator > 0, denominator, 1.0)
             I_perm = np.where(denominator > 0, I_perm, 0.0)
-            n_extreme += np.abs(I_perm) >= np.abs(I_obs)
+            if params.tail == "two-sided":
+                n_extreme += np.abs(I_perm) >= np.abs(I_obs)
+            else:
+                n_extreme += I_perm >= I_obs
 
         # Empirical two-sided p-values, with the +1/+1 stabilizer.
         p_values = (n_extreme + 1) / (B + 1)
@@ -196,15 +225,17 @@ class MoransIPermutation(Operator):
         new_matrix = matrix[:, keep].astype(np.float32, copy=False)
         new_axis = np.asarray(pm.mz_axis[:])[keep].astype(np.float64, copy=False)
         new_pm = PeakMatrix(matrix=new_matrix, mz_axis=new_axis)
-        new_extra = {**ds.extra}
-        if "consensus_prevalence" in new_extra:
-            old_prev = np.asarray(new_extra["consensus_prevalence"])
-            if old_prev.shape == (n_channels,):
-                new_extra["consensus_prevalence"] = old_prev[keep]
-        new_extra["morans_i_dropped_n"] = int((~keep).sum())
-        new_extra["morans_i_per_channel"] = I_obs.copy()
-        new_extra["morans_i_p_values"] = p_values.copy()
-        new_extra["morans_i_q_values"] = q_values.copy()
+        new_extra = subset_channel_aligned_extra(
+            ds.extra,
+            keep,
+            n_channels,
+            replacements={
+                "morans_i_dropped_n": int((~keep).sum()),
+                "morans_i_per_channel": I_obs[keep].copy(),
+                "morans_i_p_values": p_values[keep].copy(),
+                "morans_i_q_values": q_values[keep].copy(),
+            },
+        )
         new_ds = ds.with_backend(new_pm).__class__(
             coords=ds.coords,
             grid_shape=ds.grid_shape,
@@ -229,6 +260,7 @@ class MoransIPermutation(Operator):
                 "I_max": float(I_obs.max()),
                 "S0": S0,
                 "q_threshold": float(params.q_threshold),
+                "tail_two_sided": float(params.tail == "two-sided"),
             },
             payload={
                 "I_obs": I_obs,

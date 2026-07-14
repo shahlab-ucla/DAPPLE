@@ -12,25 +12,54 @@ how thresholds are picked, where the defaults come from — read the
 
 ## 1. Install
 
-DAPPLE is a normal Python package; you install it into a virtual environment and
-run `napari` to pick it up automatically.
+DAPPLE supports Python 3.11 and 3.12. The bootstrap helpers create or reuse a
+repository-local `.venv`, update packaging tools, install DAPPLE with its tested
+PyQt6 binding, run `pip check`, and run the installation doctor.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
+```
+
+On macOS or Linux:
+
+```bash
+sh scripts/bootstrap.sh
+```
+
+These commands install the analyst/user environment. Contributors should use
+`-Dev` on PowerShell or `--dev` on POSIX; that mode installs DAPPLE editable
+with test, lint, typing, benchmark, and build tools.
+
+The equivalent manual user install on Windows is:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1     # Windows PowerShell
-# source .venv/bin/activate      # macOS / Linux
-
-pip install -e ".[dev]"           # editable install with test deps
-napari
+.\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\.venv\Scripts\python.exe -m pip install ".[gui]"
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m dapple.cli.doctor
 ```
 
-Confirm DAPPLE is registered:
+Use `.venv/bin/python` on macOS/Linux. The installed `dapple-doctor` command is
+equivalent to the last line. It checks the Python version, analysis and CLI
+imports, all four installed console launchers, Qt binding, and napari/npe2
+registration plus command targets. It returns a nonzero status on a required
+failure.
 
-```powershell
-python -c "from npe2 import PluginManager; pm = PluginManager.instance(); pm.discover(); print(pm.get_manifest('dapple'))"
-```
+If `.venv` is stale or incomplete, rerun the helper with `-Recreate` on
+PowerShell or `--recreate` on macOS/Linux. This explicit option removes only the
+repository-local `.venv` before rebuilding it.
 
-You should see `dapple (DAPPLE)` listed with three readers and five widgets.
+DAPPLE does not yet have a dependency-minimal headless extra: its base install
+still includes napari, QtPy, and pyqtgraph. A CLI-only machine may omit `[gui]`
+to avoid a concrete PyQt6 binding and use `dapple-doctor --headless`; that flag
+makes Qt binding and widget-target failures warnings, but does not remove the
+visualization dependencies.
+
+Current processing is CPU-bound. The `cuda`, `directml`, and `mps` extras only
+exercise experimental accelerator detection and do not promise faster
+pipelines. Readers currently materialize arrays in RAM; lazy disk-backed
+Zarr/Dask execution is not implemented.
 
 ---
 
@@ -41,22 +70,21 @@ Two equivalent ways to get started:
 ### a. Drop a dataset on the napari window
 
 ```powershell
-napari "path\to\sample.imzML"
-napari "path\to\Boone cdf"          # directory of multi-file CDF imaging
-napari "path\to\sample.spec.xml"    # re-applies a saved pipeline
+.\.venv\Scripts\python.exe -m napari "path\to\sample.imzML"
+.\.venv\Scripts\python.exe -m napari "path\to\Boone cdf"  # multi-file CDF imaging
 ```
 
-DAPPLE's reader fires automatically. A summary projection layer (peak count by
-default) is added to the canvas and the plugin's widgets become available under
-**Plugins ▸ DAPPLE**.
+DAPPLE's reader fires automatically and adds a summary projection. A
+`.spec.xml` opened by itself only displays its metadata; it does not execute the
+pipeline. Use `dapple-apply-spec` for an actual replay.
 
 ### b. Open the wizard, load from there
 
 ```powershell
-napari
+.\.venv\Scripts\python.exe -m napari
 ```
 
-Then **Plugins ▸ DAPPLE Wizard**. The wizard owns the loading flow and the
+Then **Plugins ▸ DAPPLE ▸ DAPPLE Wizard**. The wizard owns the loading flow and the
 recommended-pipeline plumbing, and is the easiest way to get a sensible result on
 a brand-new dataset.
 
@@ -99,11 +127,9 @@ next to each row tells you the source:
 The **Reset to auto-detected** button below the form discards every override
 and restores the badged values.
 
-> **About `sample_type`.** It's intentionally not exposed in the form — no
-> current operator consumes it. A planned spatial-filter operator (Moran's I
-> with permutation null) is expected to use it to set its ON/OFF default for
-> tissue vs. cell-culture data. Set it via a JSON sidecar if you need it
-> already on the data model.
+> **About `sample_type`.** Review this field explicitly. `tissue` enables the
+> Moran's I permutation filter in the recommended chain; dispersed samples do
+> not receive that spatial-coherence assumption by default.
 
 ### Page 3 — Preview projections
 
@@ -139,23 +165,33 @@ single color.
 > Polygons drawn here are picked up by the **Mass Spectrum Panel** in
 > polygon-aggregate mode and by the **Background Subtract** operator.
 
+ROI names, foreground/background roles, colors, and zero-based napari `(y, x)`
+vertices are saved in `.spec.xml`. Later ROI enrichment requires an explicit
+overlap policy: fail on any overlap (default), exclude multiply covered pixels,
+assign them to the first ROI, or allow shared membership. An enrichment
+contrast always requires its numerator and denominator pixel sets to be
+disjoint.
+
 ### Page 5 — Recommended workflow
 
 The wizard reads your `ExperimentParams` and proposes a default operator chain
 ([details](algorithms.md#recommended-pipeline)):
 
-1. **Reference-ion detection** — always.
-2. **Empirical tolerance fit** — always.
-3. **Mass recalibration** — TOF / Q-TOF families only. Per-pixel piecewise-
+1. **CWT centroiding** — first for profile data only. Dense profile samples are
+   not valid reference peaks; centroiding first prevents adjacent bins from
+   becoming false high-prevalence references.
+2. **Reference-ion detection** — always, after profile centroiding when needed.
+3. **Empirical tolerance fit** — always.
+4. **Mass recalibration** — TOF / Q-TOF families only. Per-pixel piecewise-
    linear warp from observed reference m/z values onto the consensus centroids
    (with RANSAC outlier rejection). Skipped on Orbitrap / FT-ICR where the data
    is locked enough that recalibration tends to add noise.
-4. **Per-pixel normalization** — median by default. ``tic_normalize`` and
+5. **Per-pixel normalization** — median by default. ``tic_normalize`` and
    ``reference_ion_normalize`` are also offered.
-5. **Peak picking** — ``snr_peak_pick`` for centroided data, ``cwt_peak_pick``
-   for profile data.
-6. **Consensus peak alignment** — always.
-7. **Spatial filter (Moran's I + permutation FDR)** — tissue samples only
+6. **SNR filtering** — for centroided data only. Profile data is not CWT-picked
+   a second time.
+7. **Consensus peak alignment** — always.
+8. **Spatial filter (Moran's I + permutation FDR)** — tissue samples only
    (``ExperimentParams.sample_type == "tissue"``). Drops consensus channels
    whose pixel-level intensity pattern is indistinguishable from random.
 
@@ -186,11 +222,13 @@ with its own **Enable** checkbox (default off):
   glitches / matrix-crystal hot pixels with their neighbors' median TIC.
   Enable when the Preview's TIC view shows isolated extreme-bright pixels that
   dominate auto-contrast.
-- **Prevalence FDR filter** — *after the recommended chain.* Drops consensus
-  channels whose prevalence is indistinguishable from random peak placement
-  (permutation null on the occupancy problem, BH-FDR cutoff). An empirical
-  replacement for the fixed-floor ``min_prevalence`` on the consensus card —
-  better when channel peak counts span a wide range.
+- **Experimental prevalence sensitivity filter** — *after the recommended
+  chain.* Compares channel prevalence with a with-replacement occupancy model.
+  This option is disabled by default and is not a calibrated replacement for
+  fixed ``min_prevalence``: consensus assignment itself constrains how many
+  peaks can occupy each pixel, which can make the occupancy scores
+  anti-conservative. Use it only to check sensitivity across thresholds; use
+  cohort dataset prevalence when evidence across samples is available.
 - **Background subtraction** — at the *bottom* of the chain. Drops consensus
   channels whose mean intensity in background pixels is comparable to or
   larger than in foreground pixels. Requires consensus alignment **and** at
@@ -244,10 +282,12 @@ If you go **Back**, edit a parameter, and return to this page without re-running
   results before saving.` line is appended to the log.
 - The save buttons are disabled until you re-run.
 
-The runner caches each operator's output by `(input_hash, params_hash, op_name,
-library_versions)`, so a parameter change downstream causes only the affected
-nodes to re-execute on the next run. Tweaking only the consensus alignment
-won't redo reference detection or peak picking.
+The runner's in-memory cache includes operator and node id, parameter hash,
+master RNG seed, input lineage, and library versions. ROI geometry is included
+only for operators that declare an ROI dependency, so editing a polygon keeps
+unrelated upstream numerical work reusable while invalidating background-aware
+steps. The cache lasts only for that runner/session; it is not a persistent
+disk cache.
 
 ---
 
@@ -261,8 +301,12 @@ without any extra plumbing.
 A fast pyqtgraph plot of the spectrum at the cursor's pixel **or** aggregated
 across foreground ROIs.
 
-- **Raw / Harmonized** checkboxes pick the data source. Raw is the dataset's
-  native peak list; Harmonized appears once consensus alignment has run.
+- **Raw / Harmonized** controls pick the data source. During a pipeline run,
+  Raw is the original `PeakList` retained for the same dataset identity;
+  Harmonized is the post-consensus shared-axis `PeakMatrix`. Opening a
+  harmonized processed file by itself cannot recover its pre-pipeline trace, so
+  only Harmonized is available. Opening an unrelated dataset clears stale raw
+  state.
 - **Aggregation** dropdown (mean / median / sum / max) only matters in
   polygon-aggregate mode.
 - **Mode** dropdown switches between *single pixel* (cursor-driven) and
@@ -271,6 +315,12 @@ across foreground ROIs.
   intensities first so log(0) doesn't collapse the curve.
 - **Click a stem** to surface the matching consensus channel's image — see
   *Click-to-show m/z* below.
+
+At a single pixel, Raw plots the original native peaks. In polygon-aggregate
+mode those raw spectra do not share an axis, so DAPPLE bins them onto a stable
+50-ppm log-m/z grid and labels the curve **raw (binned)**. Harmonized polygon
+aggregation works directly on the shared matrix. ROI edits propagate to both
+views retained in the live session.
 
 ### Channels Panel
 
@@ -324,6 +374,30 @@ the projection buttons.
 The wizard's *ROI* page exposed as a standalone widget. Useful when you opened
 a dataset directly and want polygon ROIs without going through the full wizard.
 
+### Spatial and developmental patterns
+
+Open **Plugins ▸ DAPPLE ▸ Spatial and developmental patterns** after consensus
+alignment. The panel is disabled for a raw `PeakList` because comparisons need
+the shared channels of a harmonized `PeakMatrix`.
+
+- **ROI enrichment** selects one foreground ROI as numerator and another as
+  denominator, with `error`, `exclude`, or `first` overlap handling, trim
+  fraction, and minimum pixels/group. The result table ranks m/z channels by
+  q-value/effect and reports log2 fold change, q-value, and prevalence
+  difference; the plot is an effect-versus-significance view.
+- **Developmental axis** accepts zero-based start/end `(y, x)`, endpoint labels,
+  an optional corridor half-width, optional single-ROI restriction, bins,
+  permutations, and seed. You may enter coordinates or select a napari Shapes
+  line and click **Use endpoints of active Shapes line**. The table reports
+  pattern, rho, q-value, and end/start enrichment; selecting a row plots that
+  channel's binned profile.
+- **Show selected ion** sends the table row's m/z to Channels. Double-clicking a
+  row does the same. **Export tables…** writes the same CSV/JSON result contract
+  used by the CLI.
+
+The panel repeats the statistical warning deliberately: ROI q-values are a
+pixel-level within-image screen, not biological-replicate evidence.
+
 ### Threshold Explorer
 
 A what-if view onto the most recent run's rejection budget, without re-running
@@ -339,10 +413,12 @@ reference detection record analogous arrays). The Threshold Explorer lets you:
 - read a live "X of Y candidates would survive at threshold Z" label that
   also reports the change vs. the operator's actual current threshold.
 
-Once you've identified a threshold you like, switch to the wizard's Workflow
-page, edit the matching operator's parameter to the value you found, and click
-Run pipeline. The runner short-circuits every node whose parameters didn't
-change, so re-running with one tweak is fast.
+For prevalence, the slider value maps directly to `min_prevalence`. For KDE
+prominence, the slider is a **density cutoff** but the workflow field is a
+**density quantile**; use the plot to decide whether to raise or lower
+`min_prominence_quantile`, not to copy the displayed density number. Then click
+Run pipeline. The runner short-circuits every node whose parameters did not
+change, so a one-knob re-run is fast.
 
 The panel auto-discovers the active wizard via the napari viewer's docked
 widgets; opening it as a standalone widget after a wizard run is a one-click
@@ -359,8 +435,8 @@ The flow:
 
 1. Pick a cohort root directory (or browse).
 2. Optionally tweak the file pattern (default `*.imzML`), recursive toggle,
-   and the alignment knobs (bandwidth, min cohort prevalence, recalibration,
-   normalization).
+   bandwidth, per-dataset recalibration/normalization, pool weighting, and the
+   prevalence denominator.
 3. **Discover datasets** — pre-flight: lists every matching file plus its
    pixel count without running. Use this to confirm the cohort before
    committing to a long run.
@@ -372,15 +448,25 @@ The flow:
 Outputs land in the chosen output directory (defaults to
 `<cohort_root>/dapple_cohort/`):
 
-- `<stem>_cohort.imzML + .ibd` per dataset
+- `<stem>_cohort.imzML + .ibd + .dapple-axis.json` per dataset (keep all three together)
 - `<stem>_cohort.tif + _channels.csv` per dataset
-- `cohort_summary.json` — shared `mz_axis`, per-dataset prevalence vectors,
-  cohort prevalence vector, run diagnostics, and the params used
+- `cohort_summary.json` — `shared_consensus_mz`, pixel-weighted
+  `cohort_prevalence`, one-vote-per-dataset `dataset_prevalence`, per-dataset
+  prevalence vectors, selected filter, parameters, identities, and diagnostics
 
 Each per-dataset `.imzML` is a DAPPLE-harmonized export — open it later in
 napari and it loads back into the Channels Panel and Spectrum Panel as a
 PeakMatrix-backed dataset (consensus rows, "harmonized" toggle, etc.) without
 having to re-run any pipeline.
+
+The default **Equal weight per dataset** pool normalizes KDE weight within each
+dataset, preventing a large or high-intensity acquisition from determining the
+shared peaks. **Raw pooled intensity** deliberately restores that dominance.
+The prevalence denominator is independent: **All cohort pixels** answers how
+common a channel is over measured pixels and weights large images more;
+**Datasets carrying the channel** asks whether each dataset has at least one
+carrier and gives every dataset one vote. Both vectors are exported regardless
+of which one enforces the minimum.
 
 ---
 
@@ -388,7 +474,7 @@ having to re-run any pipeline.
 
 ### Drop-and-go (no wizard)
 
-1. `napari path\to\dataset.imzML` (or directory).
+1. `.\.venv\Scripts\python.exe -m napari path\to\dataset.imzML` (or directory).
 2. Open **Plugins ▸ DAPPLE ▸ Channels** — you'll see the summary projections.
 3. Open **Plugins ▸ DAPPLE ▸ Mass Spectrum Panel** — hover the canvas to see
    per-pixel spectra.
@@ -397,12 +483,12 @@ having to re-run any pipeline.
 
 ### Re-applying a saved pipeline
 
-If a colleague hands you a `dataset.spec.xml`, drag it onto napari. The plugin
-prints a summary to the console (pipeline length, experiment params, library
-versions) and adds a placeholder layer with the spec attached as metadata. Open
-the wizard, **Load** the original dataset, and advance to the **Workflow** page.
-Cross-session restore of saved cards from the spec is planned; until then,
-re-enter the parameter values from the spec into the workflow cards manually.
+Opening `dataset.spec.xml` in napari shows a metadata summary only. To actually
+restore the operator chain and run it on a fresh input, use
+`dapple-apply-spec` (documented below). Serialized ROI polygons are restored
+automatically only when the input hash matches. On a different input,
+`--reuse-rois` is an explicit assertion that the image has already been
+registered to the same pixel coordinate system.
 
 ### Sidecar metadata
 
@@ -429,9 +515,7 @@ project-local fields.
 Hot pixels are detector glitches that show up as one bright cell against the
 tissue map. To detect and replace them:
 
-1. Add a `hot_pixel_filter` step before the recommended pipeline (custom
-   pipeline support is in `pipeline/recommend.py`; surfacing this directly in
-   the wizard's WorkflowPage is a future UI enhancement).
+1. Enable the **Hot-pixel correction** optional card at the top of the workflow.
 2. Pick a correction strategy: `neighbors_median` (preserves peak count by
    scaling the spike to its neighbors' median TIC) is the conservative default.
 3. The diagnostic tells you how many pixels were flagged at your chosen `k_mad`
@@ -442,7 +526,7 @@ tissue map. To detect and replace them:
 Once you've run consensus alignment **and** drawn at least one foreground (and
 optionally one background) ROI:
 
-1. Add a `background_subtract` step after consensus.
+1. Enable the **Background subtraction** optional card after consensus.
 2. Mode `reject_channels` (the default) drops any consensus channel whose
    `mean(bg) / mean(fg) ≥ 0.5`. Lower the threshold to be stricter.
 3. Mode `subtract` instead removes the per-channel background mean from every
@@ -512,62 +596,149 @@ cohort_root/
   ...
 ```
 
-The simplest invocation is the headless CLI:
+The simplest invocation is the command-line workflow, which does not open a
+napari window:
 
 ```powershell
-dapple-cohort-align "C:\path\to\cohort_root" -o "C:\path\to\cohort_aligned"
+.\.venv\Scripts\python.exe -m dapple.cli.cohort_align `
+  "C:\path\to\cohort_root" -o "C:\path\to\cohort_aligned"
 ```
 
 Outputs in `cohort_aligned/`:
 
-- `<stem>_cohort.imzML + .ibd` for each input — same m/z axis, ready to load.
+- `<stem>_cohort.imzML + .ibd + .dapple-axis.json` for each input — same m/z
+  axis, ready to load; keep the three files together.
 - `<stem>_cohort.tif + _cohort_channels.csv` for each input — multipage TIFF
   on the shared axis, sidecar CSV with per-channel `mz` / `prevalence`.
-- `cohort_summary.json` — the shared `mz_axis`, per-dataset prevalence,
-  cohort prevalence, and run diagnostics.
+- `cohort_summary.json` — `shared_consensus_mz`, pixel- and dataset-prevalence,
+  per-dataset prevalence, selected filter, parameters, input identities, and
+  run diagnostics.
 
 Common flags:
 
 ```powershell
-# Tighter peak picking (cohort-wide default is conservative)
-dapple-cohort-align cohort_root --bandwidth-ppm 25 --min-prevalence 0.7 -o out
+# Sample-balanced peak discovery (default) and one presence vote per dataset
+.\.venv\Scripts\python.exe -m dapple.cli.cohort_align cohort_root `
+  --pool-weighting sample --prevalence-basis dataset `
+  --min-prevalence 0.5 -o out
 
 # Skip per-dataset MSIWarp recalibration (already-recalibrated data)
-dapple-cohort-align cohort_root --no-recalibrate -o out
+.\.venv\Scripts\python.exe -m dapple.cli.cohort_align cohort_root `
+  --no-recalibrate -o out
 
 # Walk subdirectories
-dapple-cohort-align cohort_root --recursive -o out
+.\.venv\Scripts\python.exe -m dapple.cli.cohort_align cohort_root `
+  --recursive -o out
 
-# Match a non-default extension
-dapple-cohort-align cohort_root --pattern '*.imzml' -o out
+# Deliberately let raw pooled intensity drive shared-peak discovery
+.\.venv\Scripts\python.exe -m dapple.cli.cohort_align cohort_root `
+  --pool-weighting intensity -o out
 ```
 
-The harmonization computes one shared consensus axis from all datasets pooled
-together, so every output has the same number of channels in the same order.
-You can stack the per-dataset `.tif` files into a `(n_datasets, H, W,
-n_channels)` tensor without further alignment.
+The default sample-balanced pool gives every dataset equal total KDE weight.
+`--pool-weighting intensity` lets larger/brighter datasets dominate candidate
+discovery. Separately, `--prevalence-basis pixel` (default) thresholds the
+fraction of all cohort pixels carrying a channel, whereas `dataset` thresholds
+the fraction of datasets with at least one carrier. The first weights large
+images more; the second is a presence/absence vote, not an abundance test.
+
+Every output has the same channels in the same order, but raster shapes can
+differ. Register/pad anatomy explicitly before stacking spatial tensors.
 
 > The cohort flow is also exposed in code: ``from dapple.cohort.align import
 > align_cohort, load_cohort_directory``. Use this when you want to inject the
 > result into a downstream Python analysis without going through the JSON
 > manifest.
 
-### Headless reapplication via `dapple-apply-spec`
+### ROI enrichment and developmental-axis patterns
+
+These analyses require a harmonized DAPPLE imzML. Keep three files together:
+`.imzML`, `.ibd`, and `.dapple-axis.json`; the sidecar restores the shared
+`PeakMatrix`. ROI polygons live separately in the run's `.spec.xml`, including
+their names, foreground/background roles, colors, and zero-based `(y, x)`
+vertices.
+
+Compare one ROI (or repeated-name union) with another:
+
+```powershell
+.\.venv\Scripts\python.exe -m dapple.cli.analyze_patterns roi `
+  out\embryo_harmonized.imzML `
+  --roi-spec out\embryo_harmonized.spec.xml `
+  --numerator head --denominator trunk `
+  --overlap-policy exclude -o out\patterns --stem head_vs_trunk
+```
+
+Positive `log2_fold_change` means enriched in the numerator. Repeat
+`--numerator` or `--denominator` to form a named ROI union. The overlap choices
+are `error` (default), `exclude`, `first`, and `allow`; even with `allow`, the
+final numerator and denominator masks must not share pixels.
+
+Analyze a directed anterior-to-posterior segment, optionally restricted to a
+saved ROI union:
+
+```powershell
+.\.venv\Scripts\python.exe -m dapple.cli.analyze_patterns axis `
+  out\embryo_harmonized.imzML `
+  --start 40 15 --end 40 180 `
+  --axis-name AP --start-label anterior --end-label posterior `
+  --half-width 25 --bins 20 --permutations 999 --seed 0 `
+  --roi-spec out\embryo_harmonized.spec.xml --roi-name embryo `
+  -o out\patterns --stem ap_axis
+```
+
+Axis coordinates follow napari image order **Y X**, zero-based. `t=0` is the
+named start and `t=1` the named end. The endpoint effect is end over start;
+reversing the endpoints negates Spearman rho and endpoint log2 enrichment and
+maps peak position to `1-t`, while the two-sided permutation p/q values and
+concentration remain unchanged for the same seed.
+
+The equivalent core API is:
+
+```python
+from dapple.analysis import (
+    DirectedAxis,
+    analyze_axis_profiles,
+    analyze_roi_enrichment,
+    export_analysis_result,
+    rasterize_rois,
+)
+```
+
+`rasterize_rois` creates explicit populated-pixel masks;
+`analyze_roi_enrichment` and `analyze_axis_profiles` return immutable result
+objects with pandas table helpers; `export_analysis_result` writes CSV tables
+and a JSON manifest containing the source-data hash, orientation/axis geometry,
+scientific thresholds, software versions, inference status, warnings, and a
+spatial fingerprint. See the [analysis algorithms](algorithms.md#roi-enrichment-analysis)
+for signatures and label precedence.
+
+> **Statistical interpretation:** ROI Welch tests use pixels as units. They are
+> within-image screens, not biological-replicate tests, and spatial
+> autocorrelation can make their p-values optimistic. Axis bin permutations
+> likewise test ordered structure inside one image. For population claims,
+> aggregate ROI effects or axis profiles within each independent specimen and
+> fit the biological model with specimens—not pixels—as independent units.
+
+### Command-line reapplication via `dapple-apply-spec`
 
 To re-run a saved pipeline on a new dataset without launching napari:
 
 ```powershell
 # Apply spec to fresh dataset, write all three outputs
-dapple-apply-spec "C:\path\to\new_dataset.imzML" "C:\path\to\saved.spec.xml"
+.\.venv\Scripts\python.exe -m dapple.cli.apply_spec `
+  "C:\path\to\new_dataset.imzML" "C:\path\to\saved.spec.xml"
 
 # Choose where outputs go
-dapple-apply-spec dataset.imzML saved.spec.xml -o out\dataset_harmonized
+.\.venv\Scripts\python.exe -m dapple.cli.apply_spec `
+  dataset.imzML saved.spec.xml -o out\dataset_harmonized
 
 # TIFF only (skip imzML write)
-dapple-apply-spec dataset.imzML saved.spec.xml --no-imzml -o out\
+.\.venv\Scripts\python.exe -m dapple.cli.apply_spec `
+  dataset.imzML saved.spec.xml --no-imzml -o out\
 
 # Override the spec's RNG seed (for reproducibility experiments)
-dapple-apply-spec dataset.imzML saved.spec.xml --rng-seed 42 -o out\
+.\.venv\Scripts\python.exe -m dapple.cli.apply_spec `
+  dataset.imzML saved.spec.xml --rng-seed 42 -o out\
 ```
 
 The CLI:
@@ -576,14 +747,17 @@ The CLI:
    seed) from XML.
 2. Loads the input dataset (auto-detects imzML, single-CDF, or multi-CDF
    directory).
-3. Runs the pipeline through the same `PipelineRunner` the wizard uses, with
-   the same content-addressed cache.
+3. Runs the pipeline through the same `PipelineRunner` the wizard uses. The CLI
+   process starts with an empty in-memory cache.
 4. Writes the post-pipeline dataset out as imzML, multipage TIFF, and a fresh
    `.spec.xml` capturing the rerun.
 
 This is the right tool for batch processing (a directory of new acquisitions
-all run through the same SOP), CI-style reproducibility checks (saved spec on
-git-pinned data should hash bit-equal), and headless server use cases.
+all run through the same SOP), CI-style lineage checks, and non-interactive
+server use cases (with the base visualization dependencies still installed).
+Numerical regression checks should pin the environment and compare
+scientific outputs with declared tolerances; a saved spec does not guarantee
+bit-identical results across libraries or platforms.
 
 ---
 
@@ -594,10 +768,12 @@ Three formats from the **Run** page after a successful run:
 ### `.spec.xml`
 
 A small XML file capturing every operator + parameter + RNG seed + library
-versions, plus a content-addressed hash of the input dataset. Combine
-`.spec.xml + input dataset` and DAPPLE will reproduce the run exactly. Heavy
-diagnostics (bootstrap CIs, KDE curves) are referenced via a sibling Zarr if
-present, so the XML stays human-readable.
+versions, a content-addressed input hash, scalar diagnostic summaries, and saved
+ROI definitions. `dapple-apply-spec` restores ROI geometry on a hash-matched
+input; reusing pixel coordinates on a registered but different input requires
+`--reuse-rois`. Array diagnostics such as bootstrap envelopes and KDE
+curves are not serialized automatically; there is no sibling Zarr diagnostic
+store in the current implementation.
 
 ### `.imzML` (round-trip)
 
@@ -613,6 +789,11 @@ reconstructs the dense matrix automatically** — the Channels Panel shows the
 consensus channel rows, the Mass Spectrum Panel's *Harmonized* toggle works,
 and the Threshold Explorer has data to operate on. Round-tripping a harmonized
 dataset and continuing to work on it is fully supported.
+
+The sidecar does not contain the original pre-pipeline peak lists. If you open a
+harmonized imzML in a new session, DAPPLE can show the harmonized matrix but not
+a Raw comparison. Raw-vs-harmonized overlay is available when the pipeline ran
+from the original PeakList in the current session.
 
 Third-party tools that don't know about the marker / sidecar see a normal
 processed-mode imzML and read it as a per-pixel sparse peak list, which is the
@@ -630,6 +811,18 @@ correct fallback.
 The TIFF can be opened directly in ImageJ/Fiji; the CSV gives you a quick
 manifest in Excel or pandas.
 
+### Pattern-analysis tables
+
+ROI analysis writes `<stem>_roi_enrichment.csv`; axis analysis writes
+`<stem>_axis_profiles.csv` and `<stem>_axis_statistics.csv`. Both also write
+`<stem>_manifest.json` with schema version, named contrast or axis/endpoint
+labels, source-data hash, exact directed-axis coordinates/corridor, scientific
+thresholds, software versions, inference status, warnings, table names, and a
+spatial fingerprint. The fingerprint covers the analysis-visible mask or
+directed geometry. Archive the harmonized imzML sidecar and `.spec.xml` beside
+the tables as well: the manifest verifies the source state and mask selection
+but does not embed the original spectra, pipeline, or ROI polygons.
+
 ---
 
 ## 7. Troubleshooting
@@ -637,11 +830,12 @@ manifest in Excel or pandas.
 ### "DAPPLE Wizard" not in the Plugins menu
 
 ```powershell
-python -m napari --info | grep -i dapple
+.\.venv\Scripts\python.exe -m dapple.cli.doctor
 ```
 
-If `dapple` isn't listed, re-install editable: `pip install -e .` from the
-repo root.
+Repair any required failure it reports. Contributors can rerun the bootstrap
+with `-Dev`; users can rerun the normal bootstrap. The doctor verifies the same
+npe2 discovery path napari uses.
 
 ### TIC projection looks bimodal
 

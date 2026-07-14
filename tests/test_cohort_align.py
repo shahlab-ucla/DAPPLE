@@ -9,7 +9,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dapple.cli.cohort_align import main as cohort_align_main
+from dapple.cli.cohort_align import (
+    _discover_cohort_files,
+    main as cohort_align_main,
+)
 from dapple.cohort.align import (
     CohortAlignParams,
     CohortAlignResult,
@@ -54,6 +57,13 @@ def test_align_cohort_returns_shared_axis_for_each_dataset(synth_centroided, tmp
     axis_b = np.asarray(result.aligned_datasets[1].backend.mz_axis[:])
     np.testing.assert_array_equal(axis_a, axis_b)
     np.testing.assert_array_equal(axis_a, result.shared_consensus_mz)
+    for aligned in result.aligned_datasets:
+        for key in (
+            "consensus_prevalence",
+            "cohort_prevalence",
+            "cohort_dataset_prevalence",
+        ):
+            assert np.asarray(aligned.extra[key]).shape == axis_a.shape
 
 
 def test_align_cohort_each_dataset_is_peakmatrix_backed(synth_centroided, tmp_path):
@@ -181,13 +191,14 @@ def test_load_cohort_directory_nondir_raises(tmp_path):
 
 
 def test_cohort_align_cli_end_to_end(synth_centroided, tmp_path):
-    # Build a cohort directory containing two copies of the synth.
+    # Build a nested cohort with duplicate source stems. Both outputs must be
+    # retained instead of the second dataset overwriting the first.
     root = tmp_path / "cohort_root"
     root.mkdir()
-    shutil.copy(synth_centroided, root / "a.imzML")
-    shutil.copy(synth_centroided.with_suffix(".ibd"), root / "a.ibd")
-    shutil.copy(synth_centroided, root / "b.imzML")
-    shutil.copy(synth_centroided.with_suffix(".ibd"), root / "b.ibd")
+    for subdir in (root / "one", root / "two"):
+        subdir.mkdir()
+        shutil.copy(synth_centroided, subdir / "sample.imzML")
+        shutil.copy(synth_centroided.with_suffix(".ibd"), subdir / "sample.ibd")
 
     out_dir = tmp_path / "cohort_out"
     rc = cohort_align_main(
@@ -197,6 +208,9 @@ def test_cohort_align_cli_end_to_end(synth_centroided, tmp_path):
             "--bandwidth-ppm", "20",
             "--min-prevalence", "0.5",
             "--no-recalibrate",
+            "--recursive",
+            "--pool-weighting", "intensity",
+            "--prevalence-basis", "dataset",
         ]
     )
     assert rc == 0
@@ -204,12 +218,76 @@ def test_cohort_align_cli_end_to_end(synth_centroided, tmp_path):
     summary = json.loads((out_dir / "cohort_summary.json").read_text(encoding="utf-8"))
     assert summary["n_datasets"] == 2
     assert len(summary["shared_consensus_mz"]) >= 5
+    assert len(summary["dataset_prevalence"]) == len(summary["shared_consensus_mz"])
+    assert summary["params"]["pool_weighting"] == "intensity"
+    assert summary["params"]["prevalence_basis"] == "dataset"
+    assert summary["prevalence_filter"]["basis"] == "dataset"
+    assert summary["summary_schema_version"] == 2
+    assert all(item["content_sha256"] for item in summary["datasets"])
+    assert [item["output_basename"] for item in summary["datasets"]] == [
+        "sample_cohort",
+        "sample_2_cohort",
+    ]
+    assert len(summary["output_files"]) == 11
+    assert "sample_cohort.dapple-axis.json" in summary["output_files"]
+    assert "sample_2_cohort.dapple-axis.json" in summary["output_files"]
+    assert "cohort_summary.json" in summary["output_files"]
+    assert all(
+        any(name.endswith(".dapple-axis.json") for name in item["output_files"])
+        for item in summary["datasets"]
+    )
     assert "diagnostics" in summary
-    # Per-dataset outputs are named <stem>_cohort.tif / .imzML.
-    assert (out_dir / "a_cohort.tif").exists()
-    assert (out_dir / "b_cohort.tif").exists()
-    assert (out_dir / "a_cohort.imzML").exists()
-    assert (out_dir / "b_cohort.imzML").exists()
+    assert (out_dir / "sample_cohort.tif").exists()
+    assert (out_dir / "sample_2_cohort.tif").exists()
+    assert "dataset_prevalence" in (
+        out_dir / "sample_cohort_channels.csv"
+    ).read_text(encoding="utf-8").splitlines()[0]
+    assert (out_dir / "sample_cohort.imzML").exists()
+    assert (out_dir / "sample_2_cohort.imzML").exists()
+    assert (out_dir / "sample_cohort.dapple-axis.json").exists()
+    assert (out_dir / "sample_2_cohort.dapple-axis.json").exists()
+
+
+def test_cli_discovery_excludes_nested_output_directory(tmp_path):
+    root = tmp_path / "cohort"
+    out = root / "dapple_cohort"
+    out.mkdir(parents=True)
+    source = root / "source.imzML"
+    generated = out / "source_cohort.imzML"
+    source.touch()
+    generated.touch()
+
+    files, n_excluded = _discover_cohort_files(
+        root,
+        pattern="*.imzML",
+        recursive=True,
+        exclude_dir=out,
+    )
+
+    assert files == [source]
+    assert n_excluded == 1
+
+
+def test_cli_discovery_excludes_harmonized_outputs_when_output_is_root(tmp_path):
+    root = tmp_path / "cohort"
+    root.mkdir()
+    source = root / "source.imzML"
+    generated = root / "source_cohort.imzML"
+    source.touch()
+    generated.touch()
+    generated.with_suffix(".dapple-axis.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    files, n_excluded = _discover_cohort_files(
+        root,
+        pattern="*.imzML",
+        recursive=False,
+        exclude_dir=root,
+    )
+
+    assert files == [source]
+    assert n_excluded == 1
 
 
 def test_cohort_align_cli_missing_root_returns_1(tmp_path, capsys):

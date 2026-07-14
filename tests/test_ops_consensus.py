@@ -59,15 +59,9 @@ def test_kde_consensus_prevalence_attached(synth_centroided):
     assert ((prev >= 0) & (prev <= 1)).all()
 
 
-def test_kde_consensus_too_strict_prevalence_raises(synth_centroided):
-    ds = read_imzml(synth_centroided)
-    op = KdeConsensusAlignment()
-    with pytest.raises(RuntimeError, match="No consensus peaks survived"):
-        op.apply(
-            ds,
-            KdeConsensusParams(min_prevalence=1.01, default_tol_ppm=200.0),
-            rng=np.random.default_rng(0),
-        )
+def test_kde_consensus_rejects_invalid_prevalence_early():
+    with pytest.raises(ValueError, match="min_prevalence"):
+        KdeConsensusParams(min_prevalence=1.01, default_tol_ppm=200.0)
 
 
 def test_kde_consensus_history_recorded(synth_centroided):

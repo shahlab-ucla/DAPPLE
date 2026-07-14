@@ -201,3 +201,56 @@ def test_runner_per_node_seed_is_deterministic(synth_centroided):
     a = PipelineRunner().run(p, ds).output
     b = PipelineRunner().run(p, ds).output
     np.testing.assert_array_equal(np.asarray(a.backend.matrix[:]), np.asarray(b.backend.matrix[:]))
+
+
+def test_runner_cache_does_not_cross_rng_seeds(synth_centroided):
+    """A reused runner must not serve provenance from a different master seed."""
+    from dataclasses import replace
+
+    ds = read_imzml(synth_centroided)
+    node = Node(
+        id="normalize",
+        op_name="median_normalize",
+        params=NormalizeParams(method="median"),
+    )
+    p1 = Pipeline(nodes=(node,), rng_seed=1, library_versions={"numpy": np.__version__})
+    p2 = replace(p1, rng_seed=2)
+    runner = PipelineRunner()
+    first = runner.run(p1, ds).output
+    executed: list[str] = []
+    second = runner.run(
+        p2,
+        ds,
+        on_node_done=lambda node_id, _result: executed.append(node_id),
+    ).output
+    assert executed == ["normalize"]
+    assert first.hash() != second.hash()
+
+
+def test_roi_independent_cache_rebinds_current_annotations(synth_centroided):
+    from dapple.data.metadata import RoiDef
+
+    ds = read_imzml(synth_centroided)
+    pipeline = Pipeline(
+        nodes=(
+            Node(
+                id="normalize",
+                op_name="median_normalize",
+                params=NormalizeParams(method="median"),
+            ),
+        )
+    )
+    runner = PipelineRunner()
+    runner.run(pipeline, ds)
+    roi = RoiDef(
+        name="new annotation",
+        vertices=((0.0, 0.0), (0.0, 2.0), (2.0, 0.0)),
+    )
+    executed: list[str] = []
+    result = runner.run(
+        pipeline,
+        ds.with_rois((roi,)),
+        on_node_done=lambda node_id, _result: executed.append(node_id),
+    )
+    assert executed == []
+    assert result.output.rois == (roi,)

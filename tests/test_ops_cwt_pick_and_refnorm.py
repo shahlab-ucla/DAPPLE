@@ -26,9 +26,13 @@ def _make_profile_dataset() -> MSIDataset:
     n_x = n_y = 5
     n_pixels = n_x * n_y
     base_peaks = np.array([200.0, 300.0, 400.0])
-    n_grid = 1024
+    # Resolve each planted profile peak with multiple native samples. The former
+    # 1,024-point grid had 0.29 Da spacing for a 0.05 Da FWHM, so the supposed
+    # profile features were mathematically under-sampled and tests passed via
+    # interpolation artefacts rather than real peaks.
+    n_grid = 8192
     mz_grid = np.linspace(150.0, 450.0, n_grid)
-    fwhm_mz = 0.05  # ~100 ppm at m/z 500
+    fwhm_mz = 0.1
 
     pixel_mz: list[np.ndarray] = []
     pixel_int: list[np.ndarray] = []
@@ -118,6 +122,39 @@ def test_cwt_default_params_have_labels_and_help():
         assert field_help(f)
 
 
+def test_profile_recommendation_picks_before_reference_detection():
+    from dapple.pipeline import recommend_pipeline
+
+    ds = _make_profile_dataset()
+    pipeline = recommend_pipeline(ds.metadata)
+    ids = tuple(node.id for node in pipeline.nodes)
+    assert ids[0] == "pick"
+    assert ids.index("pick") < ids.index("ref")
+    ref = next(node for node in pipeline.nodes if node.id == "ref")
+    assert ref.upstream == ("pick",)
+
+
+def test_reference_detection_after_profile_pick_finds_landmarks():
+    ds = _make_profile_dataset()
+    picked = CwtPeakPick().apply(
+        ds,
+        CwtPeakPickParams(
+            width_min_ppm=20.0,
+            width_max_ppm=300.0,
+            n_widths=10,
+            grid_ppm_step=10.0,
+            min_snr=2.0,
+        ),
+        rng=np.random.default_rng(0),
+    ).dataset
+    result = DetectReferenceIons().apply(
+        picked,
+        DetectReferenceIons().default_params(ds.metadata),
+        rng=np.random.default_rng(0),
+    )
+    assert result.dataset.extra["reference_set"].mz.size >= 3
+
+
 # ---- reference_ion_normalize ----------------------------------------------------
 
 
@@ -153,6 +190,34 @@ def test_reference_ion_normalize_preserves_peak_count(synth_centroided):
     np.testing.assert_array_equal(
         ds.backend.per_pixel_count(), result.dataset.backend.per_pixel_count()
     )
+
+
+def test_reference_ion_normalize_missing_pixel_uses_robust_factor(synth_centroided):
+    from dataclasses import replace
+
+    ds = read_imzml(synth_centroided)
+    rng = np.random.default_rng(0)
+    ds = DetectReferenceIons().apply(
+        ds, DetectReferenceIons().default_params(ds.metadata), rng=rng
+    ).dataset
+    ref = ds.extra["reference_set"]
+    per_pixel = ref.per_pixel_intensity.copy()
+    per_pixel[-1, :] = 0.0
+    ds = replace(
+        ds,
+        extra={
+            **ds.extra,
+            "reference_set": replace(ref, per_pixel_intensity=per_pixel),
+        },
+    )
+    result = ReferenceIonNormalize().apply(
+        ds,
+        ReferenceIonNormalize().default_params(ds.metadata),
+        rng=rng,
+    )
+    factors = result.diagnostics[0].payload["per_pixel_factor"]
+    assert factors[-1] == pytest.approx(np.median(factors[:-1]))
+    assert np.max(np.asarray(result.dataset.backend.intensity[:])) < 10.0
 
 
 def test_reference_ion_normalize_validate_emits_caveat():

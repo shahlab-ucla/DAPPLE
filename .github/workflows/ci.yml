@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clean-wheel-and-tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out the tracked tree
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Build source and wheel distributions
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Assert the wheel contains the DAPPLE data package
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          wheels = list(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one wheel, found: {wheels}")
+
+          required = {
+              "dapple/data/__init__.py",
+              "dapple/data/coords.py",
+              "dapple/data/dataset.py",
+              "dapple/data/hashing.py",
+              "dapple/data/metadata.py",
+              "dapple/data/metadata_source.py",
+          }
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = set(archive.namelist())
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(f"wheel is missing core data files: {missing}")
+          print(f"verified {len(required)} core data files in {wheels[0].name}")
+          PY
+
+      - name: Install the built wheel with GUI and test dependencies
+        run: |
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          python -m pip install "dapple[gui,dev] @ file://${PWD}/${wheel}"
+          python -m pip check
+
+      - name: Validate the installed plugin
+        run: dapple-doctor
+
+      - name: Smoke-test installed command wrappers
+        run: |
+          dapple-doctor --help >/dev/null
+          dapple-apply-spec --help >/dev/null
+          dapple-cohort-align --help >/dev/null
+          dapple-analyze-patterns --help >/dev/null
+
+      - name: Run tests against the installed wheel
+        run: python -m pytest -m "not real_data"

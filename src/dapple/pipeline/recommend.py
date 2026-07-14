@@ -17,10 +17,14 @@ from dapple.pipeline.pipeline import Node, Pipeline, detect_library_versions
 def recommend_pipeline(ep: ExperimentParams, *, rng_seed: int = 0) -> Pipeline:
     """Build the default pipeline for the supplied experiment.
 
-    Always:
+    Centroided data:
         detect_reference_ions → empirical_tolerance_from_reference_ions →
-        recalibrate (TOF / Q-TOF only) → median_normalize → peak_pick →
-        kde_consensus_alignment → spatial_filter (tissue only).
+        recalibrate (TOF / Q-TOF only) → median_normalize → SNR filter →
+        consensus → spatial filter (tissue only).
+
+    Profile data is CWT-picked *before* reference detection. Dense profile sample
+    points are not peaks; treating them as reference candidates makes nearly every
+    coarse bin look prevalent and destroys tolerance/recalibration estimates.
 
     Picker selection: ``cwt_peak_pick`` for profile data, ``snr_peak_pick`` for
     centroided. Recalibration is inserted for TOF / Q-TOF families where mass
@@ -32,13 +36,27 @@ def recommend_pipeline(ep: ExperimentParams, *, rng_seed: int = 0) -> Pipeline:
     """
     nodes: list[Node] = []
 
+    is_profile = ep.profile_or_centroided == "profile"
+    last_id: str | None = None
+    if is_profile:
+        pick_op = REGISTRY.get("cwt_peak_pick")()
+        nodes.append(
+            Node(
+                id="pick",
+                op_name="cwt_peak_pick",
+                params=pick_op.default_params(ep),
+                upstream=(),
+            )
+        )
+        last_id = "pick"
+
     ref_op = REGISTRY.get("detect_reference_ions")()
     nodes.append(
         Node(
             id="ref",
             op_name="detect_reference_ions",
             params=ref_op.default_params(ep),
-            upstream=(),
+            upstream=(last_id,) if last_id is not None else (),
         )
     )
 
@@ -74,17 +92,19 @@ def recommend_pipeline(ep: ExperimentParams, *, rng_seed: int = 0) -> Pipeline:
             upstream=(last_id,),
         )
     )
+    last_id = "norm"
 
-    pick_op_name = "cwt_peak_pick" if ep.profile_or_centroided == "profile" else "snr_peak_pick"
-    pick_op = REGISTRY.get(pick_op_name)()
-    nodes.append(
-        Node(
-            id="pick",
-            op_name=pick_op_name,
-            params=pick_op.default_params(ep),
-            upstream=("norm",),
+    if not is_profile:
+        pick_op = REGISTRY.get("snr_peak_pick")()
+        nodes.append(
+            Node(
+                id="pick",
+                op_name="snr_peak_pick",
+                params=pick_op.default_params(ep),
+                upstream=("norm",),
+            )
         )
-    )
+        last_id = "pick"
 
     cons_op = REGISTRY.get("kde_consensus_alignment")()
     nodes.append(
@@ -92,7 +112,7 @@ def recommend_pipeline(ep: ExperimentParams, *, rng_seed: int = 0) -> Pipeline:
             id="consensus",
             op_name="kde_consensus_alignment",
             params=cons_op.default_params(ep),
-            upstream=("pick",),
+            upstream=(last_id,),
         )
     )
 

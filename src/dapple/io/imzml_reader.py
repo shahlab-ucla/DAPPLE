@@ -106,7 +106,11 @@ def read_imzml(path: Path | str, *, lazy: bool = True) -> MSIDataset:
     }
     if _is_dapple_harmonized_imzml(imzml_path, full_root):
         try:
-            pm, prev = _restore_peakmatrix_from_peaklist(backend, imzml_path)
+            pm, prev = _restore_peakmatrix_from_peaklist(
+                backend,
+                imzml_path,
+                actual_ibd_md5=actual_md5,
+            )
             backend = pm  # type: ignore[assignment]
             if prev is not None:
                 extra["consensus_prevalence"] = prev
@@ -135,7 +139,7 @@ def read_imzml(path: Path | str, *, lazy: bool = True) -> MSIDataset:
     )
 
     # Sanity check: every coord must map into the grid.
-    coords_to_grid_index(coords_xy, grid_shape)
+    coords_to_grid_index(coords_xy, grid_shape, origin="one")
 
     if isinstance(backend, PeakList):
         total_peaks = int(np.asarray(backend.offsets[:])[-1])
@@ -417,19 +421,31 @@ def _detect_polarity(
 def _detect_mz_range(
     parser: Any, full_root: Any | None = None
 ) -> tuple[tuple[float, float], str]:
-    """Walk all spectra's lowest/highest observed m/z; aggregate to a global range."""
+    """Return the declared global observed m/z range, when it is valid.
+
+    Per-spectrum terms are preferred. DAPPLE's processed writer records the
+    same CV terms in ``fileContent``, so that standards-compliant global form
+    is used as a fallback.
+    """
     root = full_root if full_root is not None else parser.root
     try:
         ns = {"mz": "http://psi.hupo.org/ms/mzml"}
-        mins: list[float] = []
-        maxs: list[float] = []
-        for cv in root.findall(".//mz:spectrumList//mz:cvParam", ns):
-            if cv.get("accession") == "MS:1000528":  # lowest observed m/z
-                mins.append(float(cv.get("value", "nan")))
-            elif cv.get("accession") == "MS:1000527":  # highest observed m/z
-                maxs.append(float(cv.get("value", "nan")))
-        if mins and maxs:
-            return (float(min(mins)), float(max(maxs))), "imzml"
+        locations = (
+            ".//mz:spectrumList//mz:cvParam",
+            ".//mz:fileDescription/mz:fileContent/mz:cvParam",
+        )
+        for location in locations:
+            mins: list[float] = []
+            maxs: list[float] = []
+            for cv in root.findall(location, ns):
+                if cv.get("accession") == "MS:1000528":  # lowest observed m/z
+                    mins.append(float(cv.get("value", "nan")))
+                elif cv.get("accession") == "MS:1000527":  # highest observed m/z
+                    maxs.append(float(cv.get("value", "nan")))
+            if mins and maxs:
+                lower, upper = float(min(mins)), float(max(maxs))
+                if np.isfinite(lower) and np.isfinite(upper) and upper > lower:
+                    return (lower, upper), "imzml"
     except Exception:  # noqa: BLE001
         pass
     return (0.0, 1.0), "default"
@@ -518,8 +534,10 @@ def _apply_sidecars(
         try:
             metadata, source = load_spec_xml_sidecar(spec_candidate, metadata, source)
             return metadata, source, spec_candidate
-        except Exception:  # noqa: BLE001 — corrupt or wrong-namespace spec; ignore
-            pass
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                f"{spec_candidate}: could not load experiment metadata sidecar: {exc}"
+            ) from exc
 
     return metadata, source, None
 
@@ -560,7 +578,10 @@ def _is_dapple_harmonized_imzml(imzml_path: Path, full_root: Any | None) -> bool
 
 
 def _restore_peakmatrix_from_peaklist(
-    backend: PeakList, imzml_path: Path
+    backend: PeakList,
+    imzml_path: Path,
+    *,
+    actual_ibd_md5: str,
 ) -> tuple[PeakMatrix, np.ndarray | None]:
     """Reconstruct a dense (n_pixels, n_channels) PeakMatrix from the per-pixel
     sparse PeakList plus a sibling ``.dapple-axis.json`` sidecar.
@@ -583,16 +604,75 @@ def _restore_peakmatrix_from_peaklist(
         raise _HarmonizedRestoreError(
             f"could not parse {sidecar_path.name}: {e}"
         ) from e
-    shared_axis = np.asarray(sidecar.get("shared_mz_axis", []), dtype=np.float64)
+    if not isinstance(sidecar, dict):
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} must contain a JSON object, got {type(sidecar).__name__}"
+        )
+
+    version = sidecar.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} 'version' must be an integer"
+        )
+    if version != 1:
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} uses unsupported schema version {version}"
+        )
+
+    raw_md5 = sidecar.get("ibd_md5")
+    if raw_md5 is not None and not isinstance(raw_md5, str):
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} 'ibd_md5' must be a string"
+        )
+    recorded_md5 = (raw_md5 or "").strip().lower()
+    if not recorded_md5:
+        raise _HarmonizedRestoreError(f"{sidecar_path.name} has no 'ibd_md5'")
+    if recorded_md5 != actual_ibd_md5.lower():
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} belongs to a different .ibd "
+            f"(recorded MD5 {recorded_md5}, actual {actual_ibd_md5.lower()})"
+        )
+    raw_axis = sidecar.get("shared_mz_axis")
+    if not isinstance(raw_axis, list):
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} 'shared_mz_axis' must be a JSON array"
+        )
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in raw_axis):
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} 'shared_mz_axis' must contain only numbers"
+        )
+    try:
+        shared_axis = np.asarray(raw_axis, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} 'shared_mz_axis' must contain only numbers"
+        ) from exc
+    if shared_axis.ndim != 1:
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} 'shared_mz_axis' must be one-dimensional"
+        )
     if shared_axis.size == 0:
         raise _HarmonizedRestoreError(
             f"{sidecar_path.name} has no 'shared_mz_axis'"
         )
-    n_axis = int(sidecar.get("n_channels", shared_axis.size))
+    raw_n_axis = sidecar.get("n_channels", shared_axis.size)
+    if isinstance(raw_n_axis, bool) or not isinstance(raw_n_axis, int):
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} 'n_channels' must be an integer"
+        )
+    n_axis = raw_n_axis
     if n_axis != shared_axis.size:
         raise _HarmonizedRestoreError(
             f"{sidecar_path.name} 'n_channels' ({n_axis}) does not match "
             f"axis length ({shared_axis.size})"
+        )
+    if (
+        not np.isfinite(shared_axis).all()
+        or (shared_axis <= 0).any()
+        or (np.diff(shared_axis) <= 0).any()
+    ):
+        raise _HarmonizedRestoreError(
+            f"{sidecar_path.name} shared axis must be finite, positive, and strictly increasing"
         )
 
     # Build the dense matrix by binning each peak's m/z onto the shared axis.
@@ -617,6 +697,14 @@ def _restore_peakmatrix_from_peaklist(
         d_right = np.abs(sorted_axis[right] - peak_mz_all)
         d_left = np.abs(sorted_axis[left] - peak_mz_all)
         nearest = np.where(d_left <= d_right, left, right)
+        nearest_mz = sorted_axis[nearest]
+        matches = np.isclose(peak_mz_all, nearest_mz, rtol=1e-9, atol=1e-12)
+        if not matches.all():
+            worst = int(np.argmax(np.abs(peak_mz_all - nearest_mz)))
+            raise _HarmonizedRestoreError(
+                "peak m/z values do not match the recorded shared axis; "
+                f"example {peak_mz_all[worst]:.10g} vs {nearest_mz[worst]:.10g}"
+            )
         # Map sorted-index back to original axis order.
         axis_idx = sorted_idx[nearest]
         # Per-peak pixel id (gather offsets → repeat).
@@ -630,9 +718,31 @@ def _restore_peakmatrix_from_peaklist(
     prev_list = sidecar.get("consensus_prevalence")
     prev = None
     if prev_list is not None:
-        prev = np.asarray(prev_list, dtype=np.float64)
-        if prev.size != n_axis:
-            prev = None  # corrupted; ignore but keep the matrix
+        if not isinstance(prev_list, list):
+            raise _HarmonizedRestoreError(
+                f"{sidecar_path.name} 'consensus_prevalence' must be null or a JSON array"
+            )
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in prev_list
+        ):
+            raise _HarmonizedRestoreError(
+                f"{sidecar_path.name} 'consensus_prevalence' must contain only numbers"
+            )
+        try:
+            prev = np.asarray(prev_list, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise _HarmonizedRestoreError(
+                f"{sidecar_path.name} 'consensus_prevalence' must contain only numbers"
+            ) from exc
+        if prev.ndim != 1 or prev.size != n_axis:
+            raise _HarmonizedRestoreError(
+                f"{sidecar_path.name} 'consensus_prevalence' length must equal n_channels"
+            )
+        if not np.isfinite(prev).all() or np.any((prev < 0) | (prev > 1)):
+            raise _HarmonizedRestoreError(
+                f"{sidecar_path.name} 'consensus_prevalence' values must be finite and in [0, 1]"
+            )
     return pm, prev
 
 

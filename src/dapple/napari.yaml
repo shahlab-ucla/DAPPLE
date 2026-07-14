@@ -34,6 +34,9 @@ contributions:
     - id: dapple.open_cohort
       title: Cohort harmonization
       python_name: dapple.widgets.cohort:CohortWidget
+    - id: dapple.open_developmental
+      title: Spatial and developmental patterns
+      python_name: dapple.widgets.developmental:DevelopmentalAnalysisWidget
 
   readers:
     - command: dapple.read_imzml
@@ -59,3 +62,5 @@ contributions:
       display_name: Threshold Explorer
     - command: dapple.open_cohort
       display_name: Cohort harmonization
+    - command: dapple.open_developmental
+      display_name: Spatial and developmental patterns

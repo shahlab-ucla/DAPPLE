@@ -158,8 +158,9 @@ class DbscanConsensusAlignment(Operator):
         # Map original DBSCAN labels to consensus column indices.
         label_to_col = {int(lbl): i for i, lbl in enumerate(unique_labels)}
         matrix = np.zeros((n_pixels, unique_labels.size), dtype=np.float32)
-        # Track total peak assignments per cluster — needed by PrevalenceFdrFilter's
-        # null model. See KdeConsensusAlignment for the same accounting.
+        # Track total peak assignments per cluster for diagnostics and the optional
+        # experimental prevalence sensitivity calculation. See KDE for the same
+        # accounting.
         n_peaks_per_channel = np.zeros(unique_labels.size, dtype=np.int64)
         for i, lbl in enumerate(labels):
             if lbl < 0:
