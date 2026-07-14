@@ -13,6 +13,7 @@ import pytest
 
 pytest.importorskip("napari", reason="napari required for these tests")
 pytest.importorskip("pytestqt", reason="pytest-qt required for these tests")
+Qt = pytest.importorskip("qtpy.QtCore", reason="Qt binding required for these tests").Qt
 
 
 @pytest.fixture
@@ -394,7 +395,7 @@ def test_channels_panel_per_row_lut_changes_layer_colormap(
     qtbot.addWidget(panel)
     session.set_dataset(aligned)
     # Tick row 0 (first summary).
-    panel._table.item(0, 0).setCheckState(2)  # 2 = Qt.Checked  # noqa: SLF001
+    panel._table.item(0, 0).setCheckState(Qt.CheckState.Checked)  # noqa: SLF001
     layer_name = panel._layer_name_for_row(0)  # noqa: SLF001
     assert layer_name in viewer.layers
     # Change LUT to "magma" and confirm layer.colormap follows.
@@ -417,8 +418,8 @@ def test_channels_panel_blending_dropdown_propagates_to_visible_layers(
     qtbot.addWidget(panel)
     session.set_dataset(aligned)
     # Show first two rows.
-    panel._table.item(0, 0).setCheckState(2)  # noqa: SLF001
-    panel._table.item(1, 0).setCheckState(2)  # noqa: SLF001
+    panel._table.item(0, 0).setCheckState(Qt.CheckState.Checked)  # noqa: SLF001
+    panel._table.item(1, 0).setCheckState(Qt.CheckState.Checked)  # noqa: SLF001
     # Switch blending mode.
     panel._blending_combo.setCurrentText("translucent")  # noqa: SLF001
     for idx in range(2):
@@ -475,7 +476,7 @@ def test_channels_panel_managed_layers_swept_on_dataset_change(
     panel = ChannelsPanel(napari_viewer=viewer, session=session)
     qtbot.addWidget(panel)
     session.set_dataset(aligned)
-    panel._table.item(0, 0).setCheckState(2)  # noqa: SLF001
+    panel._table.item(0, 0).setCheckState(Qt.CheckState.Checked)  # noqa: SLF001
     n_before = sum(
         1
         for layer in viewer.layers
