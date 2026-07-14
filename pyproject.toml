@@ -108,7 +108,7 @@ filterwarnings = [
     # napari 0.6.6 emits this warning while triangulating valid Shapes with recent NumPy.
     # Keep the exception scoped to napari's upstream helper rather than weakening the
     # warnings-as-errors policy for DAPPLE code.
-    "ignore:'where' used without 'out', expect unitialized memory in output.*:UserWarning:napari\\.layers\\.shapes\\._accelerated_triangulate_python",
+    "ignore:'where' used without 'out', expect un(?:in)?itialized memory in output.*:UserWarning:napari\\.layers\\.shapes\\._accelerated_triangulate_python",
     # napari/vispy occasionally surface their own deprecation chatter during teardown.
     "ignore::DeprecationWarning:vispy.*",
     "ignore::DeprecationWarning:napari_console.*",
